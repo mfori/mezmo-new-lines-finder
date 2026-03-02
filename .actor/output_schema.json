@@ -1,0 +1,16 @@
+{
+	"actorOutputSchemaVersion": 1,
+	"title": "Mezmo New Lines Finder Output",
+	"properties": {
+		"dataset": {
+			"type": "string",
+			"title": "Dataset",
+			"template": "{{links.apiDefaultDatasetUrl}}/items"
+		},
+		"output": {
+			"type": "string",
+			"title": "Output (KEY_VALUE_STORE)",
+			"template": "{{links.apiDefaultKeyValueStoreUrl}}/records/OUTPUT"
+		}
+	}
+}

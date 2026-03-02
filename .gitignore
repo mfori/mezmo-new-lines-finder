@@ -1,6 +1,7 @@
 .mise.toml
 .nvim.lua
 storage
+src/debug_*.json
 
 # The rest is copied from https://github.com/github/gitignore/blob/main/Python.gitignore
 

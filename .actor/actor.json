@@ -4,6 +4,9 @@
 	"title": "Mezmo New Lines Finder",
 	"description": "Finds new log lines in Mezmo — compares today's logs against the previous 7 days and identifies new, recurring, or resolved entries.",
 	"input": "./input_schema.json",
+	"storages": {
+		"dataset": "./dataset_schema.json"
+	},
 	"version": "0.0",
 	"buildTag": "latest",
 	"meta": {

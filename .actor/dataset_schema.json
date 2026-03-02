@@ -1,0 +1,262 @@
+{
+	"actorSpecification": 1,
+	"fields": {
+		"type": "object",
+		"properties": {
+			"date_display": {
+				"type": "string",
+				"description": "Human-readable date of the analyzed day"
+			},
+			"time_range_display": {
+				"type": "string",
+				"description": "Human-readable description of the compared time ranges"
+			},
+			"query": {
+				"type": "string",
+				"description": "The Mezmo search query that was used"
+			},
+			"summary": {
+				"type": "object",
+				"description": "Aggregate counts for the analysis",
+				"properties": {
+					"today_total": {
+						"type": "integer",
+						"description": "Total error occurrences on the selected day"
+					},
+					"today_unique": {
+						"type": "integer",
+						"description": "Unique error patterns on the selected day"
+					},
+					"lastweek_total": {
+						"type": "integer",
+						"description": "Total error occurrences in the baseline period"
+					},
+					"lastweek_unique": {
+						"type": "integer",
+						"description": "Unique error patterns in the baseline period"
+					},
+					"new_count": {
+						"type": "integer",
+						"description": "Error patterns that appeared only on the selected day"
+					},
+					"recurring_count": {
+						"type": "integer",
+						"description": "Error patterns that appeared in both periods"
+					},
+					"resolved_count": {
+						"type": "integer",
+						"description": "Error patterns that appeared only in the baseline period"
+					}
+				}
+			},
+			"new": {
+				"type": "array",
+				"description": "Errors that appeared on the selected day but not in the baseline",
+				"items": {
+					"type": "object",
+					"properties": {
+						"today": { "type": "integer" },
+						"app_tag": { "type": "string" },
+						"message": { "type": "string" },
+						"detail": { "type": ["string", "null"] },
+						"sample": { "type": ["string", "null"] }
+					}
+				}
+			},
+			"recurring": {
+				"type": "array",
+				"description": "Errors that appeared in both periods",
+				"items": {
+					"type": "object",
+					"properties": {
+						"today": { "type": "integer" },
+						"lastweek": { "type": "integer" },
+						"trend": { "type": "string", "enum": ["spike", "normal", "lower"] },
+						"app_tag": { "type": "string" },
+						"message": { "type": "string" },
+						"detail": { "type": ["string", "null"] },
+						"sample": { "type": ["string", "null"] }
+					}
+				}
+			},
+			"resolved": {
+				"type": "array",
+				"description": "Errors that appeared only in the baseline period",
+				"items": {
+					"type": "object",
+					"properties": {
+						"lastweek": { "type": "integer" },
+						"app_tag": { "type": "string" },
+						"message": { "type": "string" },
+						"detail": { "type": ["string", "null"] },
+						"sample": { "type": ["string", "null"] }
+					}
+				}
+			}
+		}
+	},
+	"views": {
+		"summary": {
+			"title": "Summary",
+			"transformation": {
+				"fields": [
+					"date_display",
+					"time_range_display",
+					"query",
+					"summary.new_count",
+					"summary.recurring_count",
+					"summary.resolved_count",
+					"summary.today_total",
+					"summary.lastweek_total"
+				],
+				"flatten": ["summary"]
+			},
+			"display": {
+				"component": "table",
+				"properties": {
+					"date_display": {
+						"label": "Date",
+						"format": "text"
+					},
+					"time_range_display": {
+						"label": "Time Range",
+						"format": "text"
+					},
+					"query": {
+						"label": "Query",
+						"format": "text"
+					},
+					"summary.new_count": {
+						"label": "New",
+						"format": "number"
+					},
+					"summary.recurring_count": {
+						"label": "Recurring",
+						"format": "number"
+					},
+					"summary.resolved_count": {
+						"label": "Resolved",
+						"format": "number"
+					},
+					"summary.today_total": {
+						"label": "Today Total",
+						"format": "number"
+					},
+					"summary.lastweek_total": {
+						"label": "Baseline Total",
+						"format": "number"
+					}
+				}
+			}
+		},
+		"newErrors": {
+			"title": "New Errors",
+			"transformation": {
+				"fields": [
+					"today",
+					"app_tag",
+					"message",
+					"detail"
+				],
+				"unwind": ["new"]
+			},
+			"display": {
+				"component": "table",
+				"properties": {
+					"today": {
+						"label": "Count",
+						"format": "number"
+					},
+					"app_tag": {
+						"label": "App",
+						"format": "text"
+					},
+					"message": {
+						"label": "Error Message",
+						"format": "text"
+					},
+					"detail": {
+						"label": "Detail",
+						"format": "text"
+					}
+				}
+			}
+		},
+		"recurringErrors": {
+			"title": "Recurring Errors",
+			"transformation": {
+				"fields": [
+					"today",
+					"lastweek",
+					"trend",
+					"app_tag",
+					"message",
+					"detail"
+				],
+				"unwind": ["recurring"]
+			},
+			"display": {
+				"component": "table",
+				"properties": {
+					"today": {
+						"label": "Today",
+						"format": "number"
+					},
+					"lastweek": {
+						"label": "Baseline",
+						"format": "number"
+					},
+					"trend": {
+						"label": "Trend",
+						"format": "text"
+					},
+					"app_tag": {
+						"label": "App",
+						"format": "text"
+					},
+					"message": {
+						"label": "Error Message",
+						"format": "text"
+					},
+					"detail": {
+						"label": "Detail",
+						"format": "text"
+					}
+				}
+			}
+		},
+		"resolvedErrors": {
+			"title": "Resolved Errors",
+			"transformation": {
+				"fields": [
+					"lastweek",
+					"app_tag",
+					"message",
+					"detail"
+				],
+				"unwind": ["resolved"]
+			},
+			"display": {
+				"component": "table",
+				"properties": {
+					"lastweek": {
+						"label": "Baseline Count",
+						"format": "number"
+					},
+					"app_tag": {
+						"label": "App",
+						"format": "text"
+					},
+					"message": {
+						"label": "Error Message",
+						"format": "text"
+					},
+					"detail": {
+						"label": "Detail",
+						"format": "text"
+					}
+				}
+			}
+		}
+	}
+}

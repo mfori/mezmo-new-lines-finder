@@ -1,0 +1,63 @@
+{
+	"title": "Mezmo New Lines Finder Input",
+	"type": "object",
+	"schemaVersion": 1,
+	"required": ["query", "mezmoServiceKey"],
+	"properties": {
+		"query": {
+			"title": "Mezmo Query",
+			"type": "string",
+			"description": "Mezmo search query for error logs (e.g. '(level:error OR level:fatal) tag:production app:my-app')",
+			"editor": "textfield"
+		},
+		"mezmoServiceKey": {
+			"title": "Mezmo Service Key",
+			"type": "string",
+			"description": "Mezmo service key for API authentication (starts with 'sts_'). See https://docs.mezmo.com/docs/ingestion-key#service-keys-sts",
+			"editor": "textfield",
+			"isSecret": true
+		},
+		"debug": {
+			"title": "Debug Mode",
+			"type": "boolean",
+			"description": "Save raw MCP responses for debugging",
+			"default": false
+		},
+		"slackToken": {
+			"title": "Slack Token",
+			"type": "string",
+			"description": "Slack Bot OAuth token for sending notifications",
+			"editor": "textfield",
+			"isSecret": true
+		},
+		"slackChannel": {
+			"title": "Slack Channel",
+			"type": "string",
+			"description": "Slack channel name (e.g. '#my-channel' or 'my-channel') or channel ID (e.g. 'C0123456789'). Requires slackToken to be set.",
+			"editor": "textfield"
+		},
+		"day": {
+			"title": "Day to Analyze",
+			"type": "string",
+			"description": "Which day to analyze: 'today' (current UTC day so far), 'yesterday' (full previous UTC day), or 'last24h' (last 24 hours from now).",
+			"default": "today",
+			"enum": ["today", "yesterday", "last24h"],
+			"editor": "select"
+		},
+		"daysBack": {
+			"title": "Days Back",
+			"type": "integer",
+			"description": "Number of days before the selected day to use as the comparison baseline.",
+			"default": 7,
+			"minimum": 1,
+			"maximum": 30
+		},
+		"minCount": {
+			"title": "Minimum Count",
+			"type": "integer",
+			"description": "Minimum number of occurrences for an error to be included in the results.",
+			"default": 1,
+			"minimum": 1
+		}
+	}
+}

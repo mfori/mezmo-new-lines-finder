@@ -1,0 +1,14 @@
+{
+	"actorSpecification": 1,
+	"name": "mezmo-new-lines-finder",
+	"title": "Mezmo New Lines Finder",
+	"description": "Finds new log lines in Mezmo — compares today's logs against the previous 7 days and identifies new, recurring, or resolved entries.",
+	"input": "./input_schema.json",
+	"version": "0.0",
+	"buildTag": "latest",
+	"meta": {
+		"templateId": "python-empty",
+		"generatedBy": "<FILL-IN-MODEL>"
+	},
+	"dockerfile": "../Dockerfile"
+}

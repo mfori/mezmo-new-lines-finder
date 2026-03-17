@@ -182,13 +182,31 @@ def parse_entries(text: str) -> list[dict]:
 
 def normalize(msg: str) -> str:
     """Normalize a log message by stripping variable parts."""
+    # UUIDs (v1–v5)
     msg = re.sub(
         r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
         r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>', msg)
+    # Hex hashes: MongoDB ObjectIDs (24), short SHAs (7-12), long SHAs (40)
+    msg = re.sub(r'\b[0-9a-fA-F]{24}\b', '<HEX>', msg)
+    msg = re.sub(r'\b[0-9a-fA-F]{40}\b', '<HEX>', msg)
+    msg = re.sub(r'\b[0-9a-f]{7,12}\b', '<HEX>', msg)
+    # Memory addresses
+    msg = re.sub(r'0x[0-9a-fA-F]+', '<ADDR>', msg)
+    # IP addresses with optional port
     msg = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?', '<IP>', msg)
+    # ISO timestamps
     msg = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[.\dZ+:\-]*', '<TS>', msg)
+    # Durations with units (e.g., 1523ms, 3.2s, 500µs)
+    msg = re.sub(r'\b\d+(\.\d+)?\s*(ms|µs|us|ns|s|sec|seconds|minutes|min)\b', '<DUR>', msg)
+    # Large numeric IDs (6+ digits)
     msg = re.sub(r'\b\d{6,}\b', '<ID>', msg)
+    # Labeled IDs (e.g., "request ID: 3", "id: 42")
+    msg = re.sub(r'(?i)\b(id|ID|Id)[:\s]+\d+\b', r'\1: <ID>', msg)
+    # URL paths with numeric segments (e.g., /users/42/orders)
+    msg = re.sub(r'(/[a-zA-Z_-]+)/\d+', r'\1/<ID>', msg)
+    # Kubernetes pod suffixes
     msg = re.sub(r'-[a-z0-9]{5,10}-[a-z0-9]{5}\b', '-<POD>', msg)
+    # Collapse whitespace
     msg = re.sub(r'\s+', ' ', msg).strip()
     return msg
 
@@ -463,8 +481,10 @@ def _detail_html(detail: str | None, style: str = "") -> str:
     return f'\n              <div class="detail"{s}>{_e(detail)}</div>'
 
 
-def _new_section(env: str, items: list[dict]) -> str:
-    env_label = "staging" if env == "staging" else "production"
+def _new_section(env: str, items: list[dict], day_label: str = "Today", env_label: str | None = None) -> str:
+    day_lower = day_label.lower()
+    if env_label is None:
+        env_label = "staging" if env == "staging" else "production"
     count = len(items)
     header = f"""
   <div class="section">
@@ -477,7 +497,7 @@ def _new_section(env: str, items: list[dict]) -> str:
         return header + f"""
     <div class="empty-state">
       <div class="icon">&#10004;</div>
-      <p>No new error patterns on {env_label} today.</p>
+      <p>No new error patterns{f" on {env_label}" if env_label else ""} {day_lower}.</p>
     </div>
   </div>"""
 
@@ -493,12 +513,12 @@ def _new_section(env: str, items: list[dict]) -> str:
 
     return header + f"""
     <div class="callout danger">
-      <strong>{count} new error pattern{"s" if count != 1 else ""}</strong> appeared in {env_label} today that were not seen in the previous week.
+      <strong>{count} new error pattern{"s" if count != 1 else ""}</strong> appeared{f" in {env_label}" if env_label else ""} {day_lower} that were not seen in the previous week.
     </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
-          <th style="width:80px">Today</th>
+          <th style="width:80px">{day_label}</th>
           <th style="width:180px">App</th>
           <th>Error Message</th>
           <th style="width:120px">Severity</th>
@@ -510,7 +530,7 @@ def _new_section(env: str, items: list[dict]) -> str:
   </div>"""
 
 
-def _recurring_section(env: str, items: list[dict]) -> str:
+def _recurring_section(env: str, items: list[dict], day_label: str = "Today") -> str:
     table_id = f"recurring-{env}"
     count = len(items)
     spikes = [e for e in items if e["trend"] == "spike"]
@@ -535,7 +555,7 @@ def _recurring_section(env: str, items: list[dict]) -> str:
         s = spikes[0]
         callout = f"""
     <div class="callout warning">
-      <strong>Spike detected:</strong> <code>{_e(s["message"][:80])}</code> jumped from <strong>{_f(s["lastweek"])}</strong> last week to <strong>{_f(s["today"])}</strong> today.
+      <strong>Spike detected:</strong> <code>{_e(s["message"][:80])}</code> jumped from <strong>{_f(s["lastweek"])}</strong> last week to <strong>{_f(s["today"])}</strong> {day_label.lower()}.
     </div>"""
 
     rows = ""
@@ -575,7 +595,7 @@ def _recurring_section(env: str, items: list[dict]) -> str:
     <div class="table-wrap">
       <table id="{table_id}">
         <thead><tr>
-          <th style="width:80px">Today</th>
+          <th style="width:80px">{day_label}</th>
           <th style="width:90px">Last Week</th>
           <th style="width:60px">Trend</th>
           <th style="width:180px">App</th>
@@ -588,17 +608,18 @@ def _recurring_section(env: str, items: list[dict]) -> str:
   </div>"""
 
 
-def _resolved_section(env: str, items: list[dict]) -> str:
+def _resolved_section(env: str, items: list[dict], day_label: str = "Today", env_label: str | None = None) -> str:
     table_id = f"resolved-{env}"
     total = len(items)
     shown_items = items[:MAX_RESOLVED_SHOWN]
     shown = len(shown_items)
-    env_label = "staging" if env == "staging" else "production"
+    if env_label is None:
+        env_label = "staging" if env == "staging" else "production"
 
     header = f"""
   <div class="section">
     <div class="section-header">
-      <h2>Errors Stopped Today</h2>
+      <h2>Errors Stopped {day_label}</h2>
       <span class="badge badge-resolved">{total} patterns</span>
     </div>"""
 
@@ -606,7 +627,7 @@ def _resolved_section(env: str, items: list[dict]) -> str:
         return header + f"""
     <div class="empty-state">
       <div class="icon">&#9679;</div>
-      <p>No resolved error patterns on {env_label}.</p>
+      <p>No resolved error patterns{f" on {env_label}" if env_label else ""}.</p>
     </div>
   </div>"""
 
@@ -650,7 +671,7 @@ def _resolved_section(env: str, items: list[dict]) -> str:
   </div>"""
 
 
-def _env_tab(env: str, env_data: dict, active: bool) -> str:
+def _env_tab(env: str, env_data: dict, active: bool, day_label: str = "Today") -> str:
     """Generate a full environment tab (staging or production)."""
     d = env_data
     active_cls = " active" if active else ""
@@ -659,7 +680,7 @@ def _env_tab(env: str, env_data: dict, active: bool) -> str:
     stats = f"""
   <div class="stats-row" style="margin-top:24px;">
     <div class="stat-card">
-      <div class="label">Today Errors</div>
+      <div class="label">{day_label} Errors</div>
       <div class="value" style="color:{color};">{_f(d["today_count"])}</div>
       <div class="sub">{d["today_unique"]} unique patterns</div>
     </div>
@@ -669,20 +690,20 @@ def _env_tab(env: str, env_data: dict, active: bool) -> str:
       <div class="sub">{d["lastweek_unique"]} unique patterns</div>
     </div>
     <div class="stat-card red">
-      <div class="label">New Today</div>
+      <div class="label">New {day_label}</div>
       <div class="value">{d["new_count"]}</div>
       <div class="sub">{d["new_count"]} new error types</div>
     </div>
     <div class="stat-card">
-      <div class="label">Stopped Today</div>
+      <div class="label">Stopped {day_label}</div>
       <div class="value" style="color:var(--green);">{d["resolved_count"]}</div>
       <div class="sub">Patterns from last week gone</div>
     </div>
   </div>"""
 
-    new_html = _new_section(env, d["new"])
-    recurring_html = _recurring_section(env, d["recurring"])
-    resolved_html = _resolved_section(env, d["resolved"])
+    new_html = _new_section(env, d["new"], day_label)
+    recurring_html = _recurring_section(env, d["recurring"], day_label)
+    resolved_html = _resolved_section(env, d["resolved"], day_label)
 
     return f"""
 <div id="tab-{env}" class="tab-content{active_cls}">
@@ -695,6 +716,7 @@ def _env_tab(env: str, env_data: dict, active: bool) -> str:
 
 def generate_html(data: dict) -> str:
     s = data["summary"]
+    day_label = data.get("day_label", "Today")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -733,7 +755,7 @@ def generate_html(data: dict) -> str:
     <div class="sub">{_f(s["resolved_staging"])} staging &middot; {_f(s["resolved_production"])} production</div>
   </div>
   <div class="stat-card blue">
-    <div class="label">Total Errors Today</div>
+    <div class="label">Total Errors {day_label}</div>
     <div class="value">{_f(s["today_total"])}</div>
     <div class="sub">{_f(s["today_staging"])} staging &middot; {_f(s["today_production"])} production</div>
   </div>
@@ -749,11 +771,84 @@ def generate_html(data: dict) -> str:
   <div class="tab" onclick="switchTab('production')">Production</div>
 </div>
 
-{_env_tab("staging", data["staging"], active=True)}
-{_env_tab("production", data["production"], active=False)}
+{_env_tab("staging", data["staging"], active=True, day_label=day_label)}
+{_env_tab("production", data["production"], active=False, day_label=day_label)}
 
 <div style="text-align:center;padding:32px 0 16px;color:var(--text-dim);font-size:12px;border-top:1px solid var(--border);margin-top:24px;">
   Generated from Mezmo logs &middot; Apps: {", ".join(APPS)}
+  <br>Time range: {_e(data["date_display"])} {_e(data["time_range_display"])}
+</div>
+
+<script>
+{JS}
+</script>
+</body>
+</html>"""
+
+
+def generate_single_html(data: dict) -> str:
+    """Generate an HTML dashboard for a single-query result (no staging/production tabs)."""
+    s = data["summary"]
+    day_label = data.get("day_label", "Today")
+
+    new_html = _new_section("main", data["new"], day_label, env_label="")
+    recurring_html = _recurring_section("main", data["recurring"], day_label)
+    resolved_html = _resolved_section("main", data["resolved"], day_label, env_label="")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mezmo Error Report &mdash; {_e(data["date_display"])}</title>
+<style>
+{CSS}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Mezmo</span> Error Report</h1>
+  <div class="header-meta">
+    <span style="color:var(--text-dim);font-size:13px;">{_e(data["date_display"])} &middot; {_e(data["time_range_display"])}</span>
+  </div>
+</div>
+
+<div style="color:var(--text-dim);font-size:12px;margin-bottom:24px;">
+  Query: <code style="color:var(--accent);font-size:11px;">{_e(data.get("query", ""))}</code>
+</div>
+
+<div class="stats-row">
+  <div class="stat-card red">
+    <div class="label">New Patterns</div>
+    <div class="value">{s["new_count"]}</div>
+  </div>
+  <div class="stat-card orange">
+    <div class="label">Recurring</div>
+    <div class="value">{s["recurring_count"]}</div>
+  </div>
+  <div class="stat-card green">
+    <div class="label">Resolved</div>
+    <div class="value">{s["resolved_count"]}</div>
+  </div>
+  <div class="stat-card blue">
+    <div class="label">{day_label} Total</div>
+    <div class="value">{_f(s["today_total"])}</div>
+    <div class="sub">{s["today_unique"]} unique patterns</div>
+  </div>
+  <div class="stat-card accent">
+    <div class="label">Last Week Total</div>
+    <div class="value">{_f(s["lastweek_total"])}</div>
+    <div class="sub">{s["lastweek_unique"]} unique patterns</div>
+  </div>
+</div>
+
+{new_html}
+{recurring_html}
+{resolved_html}
+
+<div style="text-align:center;padding:32px 0 16px;color:var(--text-dim);font-size:12px;border-top:1px solid var(--border);margin-top:24px;">
+  Generated from Mezmo logs
   <br>Time range: {_e(data["date_display"])} {_e(data["time_range_display"])}
 </div>
 
@@ -868,10 +963,14 @@ def run_deploy_duty(
 
     new, recurring, resolved = classify(today_g, week_g, days_back=days_back, min_count=min_count)
 
+    # ── Day label for display ────────────────────────────────────────────
+    day_label = {"yesterday": "Yesterday", "last24h": "Last 24h"}.get(day, "Today")
+
     # ── Build JSON output ──────────────────────────────────────────────
     data = {
         "date_display": date_display,
         "time_range_display": time_display,
+        "day_label": day_label,
         "query": query,
         "summary": {
             "today_total": today_total,
@@ -987,6 +1086,7 @@ def main():
     data = {
         "date_display": date_display,
         "time_range_display": time_display,
+        "day_label": "Today",
         "summary": {
             "new_total": len(stg_new) + len(prod_new),
             "new_staging": len(stg_new),

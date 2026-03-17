@@ -1,23 +1,24 @@
 # Mezmo New Lines Finder
 
-Apify Actor that analyzes Mezmo (LogDNA) error logs and classifies them by comparing a selected day against a historical baseline. It identifies **new**, **recurring**, and **resolved** error patterns, and optionally sends a summary to Slack.
+Apify Actor that analyzes Mezmo (LogDNA) error logs and classifies them by comparing a selected day against a historical baseline. It identifies **new**, **recurring**, and **resolved** error patterns, generates an interactive HTML dashboard, and optionally sends a summary to Slack.
 
 ## How it works
 
 1. Connects to Mezmo using the provided service key.
 2. Queries deduplicated logs for two time ranges:
-   - **Selected day** — today (start of UTC day to now) or yesterday (full UTC day).
+   - **Selected day** — today (start of UTC day to now), yesterday (full UTC day), or the last 24 hours.
    - **Baseline** — the N days immediately before the selected day (default 7).
-3. Normalizes error messages (strips UUIDs, IPs, timestamps, pod names, etc.) and groups them by `app::normalized_message`.
+3. Normalizes error messages (strips UUIDs, hex hashes, IPs, timestamps, durations, Kubernetes pod names, etc.) and groups them by `app::normalized_message`.
 4. Classifies each error group:
    - **New** — appeared on the selected day but not in the baseline period.
    - **Recurring** — appeared in both. Trend is computed from the daily average:
-     - *spike* — today's count > 2x daily average
-     - *lower* — today's count < 0.5x daily average
+     - *spike* — today's count > 2× daily average
+     - *lower* — today's count < 0.5× daily average
      - *normal* — within expected range
    - **Resolved** — appeared in the baseline but not on the selected day.
-5. Outputs structured JSON to the default dataset and key-value store.
-6. Optionally posts a summary to a Slack channel.
+5. Generates an interactive HTML dashboard and stores it in the key-value store.
+6. Outputs structured JSON to the default dataset and key-value store.
+7. Optionally posts a summary to a Slack channel (with a link to the dashboard).
 
 ## Input
 
@@ -28,7 +29,7 @@ Apify Actor that analyzes Mezmo (LogDNA) error logs and classifies them by compa
 | `day` | string | No | `today` | Which day to analyze: `today`, `yesterday`, or `last24h` |
 | `daysBack` | integer | No | `7` | Number of days before the selected day to use as the comparison baseline (1–30) |
 | `minCount` | integer | No | `1` | Minimum number of occurrences for an error to appear in results |
-| `debug` | boolean | No | `false` | Save raw API responses for debugging |
+| `debug` | boolean | No | `false` | Save raw MCP responses for debugging |
 | `slackToken` | string | No | — | Slack Bot OAuth token for sending notifications |
 | `slackChannel` | string | No | — | Slack channel name or ID (requires `slackToken`) |
 
@@ -48,12 +49,15 @@ Apify Actor that analyzes Mezmo (LogDNA) error logs and classifies them by compa
 
 ## Output
 
+### Dataset
+
 The Actor pushes a JSON object to the default dataset with this structure:
 
 ```json
 {
     "date_display": "Mar 02, 2026",
     "time_range_display": "00:00 – 14:30 UTC vs. Feb 23–Mar 01",
+    "day_label": "Today",
     "query": "...",
     "summary": {
         "today_total": 1234,
@@ -96,4 +100,9 @@ The Actor pushes a JSON object to the default dataset with this structure:
 }
 ```
 
-The same object is also stored as `OUTPUT` in the default key-value store.
+### Key-value store
+
+| Key | Content type | Description |
+|-----|-------------|-------------|
+| `OUTPUT` | `application/json` | Same JSON object as the dataset |
+| `dashboard.html` | `text/html` | Interactive HTML dashboard with dark theme, filterable tables, and spike callouts |

@@ -26,6 +26,7 @@ def send_slack_notification(
     result: dict,
     slack_token: str,
     slack_channel: str,
+    dashboard_url: str | None = None,
 ) -> dict | None:
     """Send analysis results to Slack.
 
@@ -37,7 +38,9 @@ def send_slack_notification(
             logger.error("Could not resolve Slack channel: %s", slack_channel)
             return None
 
-        summary_blocks = _build_summary_blocks(result)
+        day_label = result.get("day_label", "today").lower()
+
+        summary_blocks = _build_summary_blocks(result, dashboard_url)
         fallback = _build_fallback_text(result)
 
         main_resp = _post_message(slack_token, channel_id, summary_blocks, fallback)
@@ -50,11 +53,11 @@ def send_slack_notification(
 
         new_errors = result.get("new", [])
         if new_errors:
-            _post_new_errors_thread(slack_token, channel_id, thread_ts, new_errors)
+            _post_new_errors_thread(slack_token, channel_id, thread_ts, new_errors, day_label)
 
         spikes = [e for e in result.get("recurring", []) if e.get("trend") == "spike"]
         if spikes:
-            _post_spikes_thread(slack_token, channel_id, thread_ts, spikes)
+            _post_spikes_thread(slack_token, channel_id, thread_ts, spikes, day_label)
 
         return main_resp
 
@@ -107,11 +110,12 @@ def _resolve_channel(token: str, channel: str) -> str | None:
 # Block Kit builders
 # ---------------------------------------------------------------------------
 
-def _build_summary_blocks(result: dict) -> list[dict]:
+def _build_summary_blocks(result: dict, dashboard_url: str | None = None) -> list[dict]:
     s = result["summary"]
     date = result.get("date_display", "")
     time_range = result.get("time_range_display", "")
     query = result.get("query", "")
+    day_label = result.get("day_label", "Today")
 
     blocks: list[dict] = []
 
@@ -139,7 +143,7 @@ def _build_summary_blocks(result: dict) -> list[dict]:
             {"type": "mrkdwn", "text": f":rotating_light: *New Errors*\n{s['new_count']}"},
             {"type": "mrkdwn", "text": f":repeat: *Recurring*\n{s['recurring_count']}"},
             {"type": "mrkdwn", "text": f":white_check_mark: *Resolved*\n{s['resolved_count']}"},
-            {"type": "mrkdwn", "text": f":bar_chart: *Today*\n{_fmt(s['today_total'])} ({s['today_unique']} unique)"},
+            {"type": "mrkdwn", "text": f":bar_chart: *{day_label}*\n{_fmt(s['today_total'])} ({s['today_unique']} unique)"},
         ],
     })
 
@@ -152,7 +156,7 @@ def _build_summary_blocks(result: dict) -> list[dict]:
             "type": "mrkdwn",
             "text": (
                 f"*Week Comparison*\n"
-                f"Today: *{_fmt(s['today_total'])}* errors ({s['today_unique']} unique)\n"
+                f"{day_label}: *{_fmt(s['today_total'])}* errors ({s['today_unique']} unique)\n"
                 f"Last 7 days: *{_fmt(s['lastweek_total'])}* errors ({s['lastweek_unique']} unique)"
             ),
         },
@@ -173,10 +177,18 @@ def _build_summary_blocks(result: dict) -> list[dict]:
             "text": {"type": "mrkdwn", "text": f":new: *{s['new_count']} new error(s) detected* \u2014 see thread for details"},
         })
 
+    # Dashboard link
+    if dashboard_url:
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f":chart_with_upwards_trend: <{dashboard_url}|View full dashboard>"},
+        })
+
     return blocks
 
 
-def _build_new_error_batch_blocks(errors: list[dict], start_idx: int) -> list[dict]:
+def _build_new_error_batch_blocks(errors: list[dict], start_idx: int, day_label: str = "today") -> list[dict]:
     blocks: list[dict] = []
     for i, err in enumerate(errors, start=start_idx):
         app = err.get("app_tag", "unknown")
@@ -185,7 +197,7 @@ def _build_new_error_batch_blocks(errors: list[dict], start_idx: int) -> list[di
         count = err.get("today", 0)
 
         parts = [
-            f"*#{i}* `{app}` \u2014 *{_fmt(count)}x today*",
+            f"*#{i}* `{app}` \u2014 *{_fmt(count)}x {day_label}*",
             f"```{msg}```",
         ]
         if detail:
@@ -203,6 +215,7 @@ def _build_new_error_batch_blocks(errors: list[dict], start_idx: int) -> list[di
 
 def _post_new_errors_thread(
     token: str, channel: str, thread_ts: str, new_errors: list[dict],
+    day_label: str = "today",
 ) -> None:
     max_shown = ERRORS_PER_MESSAGE * MAX_ERROR_MESSAGES
     shown = new_errors[:max_shown]
@@ -210,7 +223,7 @@ def _post_new_errors_thread(
 
     for i in range(0, len(shown), ERRORS_PER_MESSAGE):
         batch = shown[i : i + ERRORS_PER_MESSAGE]
-        blocks = _build_new_error_batch_blocks(batch, start_idx=i + 1)
+        blocks = _build_new_error_batch_blocks(batch, start_idx=i + 1, day_label=day_label)
         _post_message(token, channel, blocks, f"New errors {i + 1}\u2013{i + len(batch)}", thread_ts)
 
     if remaining > 0:
@@ -224,6 +237,7 @@ def _post_new_errors_thread(
 
 def _post_spikes_thread(
     token: str, channel: str, thread_ts: str, spikes: list[dict],
+    day_label: str = "today",
 ) -> None:
     blocks: list[dict] = [{
         "type": "header",
@@ -242,7 +256,7 @@ def _post_spikes_thread(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"`{app}` *{_fmt(today)} today* (avg {_fmt(int(avg))}/day, {multiplier})\n```{msg}```",
+                "text": f"`{app}` *{_fmt(today)} {day_label}* (avg {_fmt(int(avg))}/day, {multiplier})\n```{msg}```",
             },
         })
 
@@ -318,8 +332,9 @@ def _trunc(s: str, max_len: int) -> str:
 
 def _build_fallback_text(result: dict) -> str:
     s = result["summary"]
+    day_label = result.get("day_label", "Today")
     return (
         f"Mezmo Log Report \u2014 {result.get('date_display', '')}\n"
         f"New: {s['new_count']} | Recurring: {s['recurring_count']} | Resolved: {s['resolved_count']}\n"
-        f"Today: {_fmt(s['today_total'])} errors | Last 7 days: {_fmt(s['lastweek_total'])} errors"
+        f"{day_label}: {_fmt(s['today_total'])} errors | Last 7 days: {_fmt(s['lastweek_total'])} errors"
     )

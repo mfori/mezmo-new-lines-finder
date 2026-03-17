@@ -12,7 +12,7 @@ from functools import partial
 
 from apify import Actor
 
-from .deploy_duty import run_deploy_duty
+from .deploy_duty import run_deploy_duty, generate_single_html
 from .slack_notifier import send_slack_notification
 
 
@@ -51,13 +51,24 @@ async def main() -> None:
             f"Resolved: {result['summary']['resolved_count']}"
         )
 
+        # Generate HTML dashboard and store in KVS
+        html = generate_single_html(result)
+        kvs = await Actor.open_key_value_store()
+        await kvs.set_value('dashboard.html', html, content_type='text/html')
+        dashboard_url = await kvs.get_public_url('dashboard.html')
+        Actor.log.info(f'Dashboard stored: {dashboard_url}')
+
         # Send Slack notification if configured
         if slack_token and slack_channel:
             Actor.log.info(f'Sending Slack notification to channel {slack_channel}...')
             try:
                 slack_resp = await loop.run_in_executor(
                     None,
-                    partial(send_slack_notification, result=result, slack_token=slack_token, slack_channel=slack_channel),
+                    partial(
+                        send_slack_notification,
+                        result=result, slack_token=slack_token,
+                        slack_channel=slack_channel, dashboard_url=dashboard_url,
+                    ),
                 )
                 if slack_resp and slack_resp.get('ok'):
                     Actor.log.info('Slack notification sent successfully.')
@@ -73,5 +84,4 @@ async def main() -> None:
         await Actor.push_data(result)
 
         # Also store as OUTPUT in key-value store for direct access
-        kvs = await Actor.open_key_value_store()
         await kvs.set_value('OUTPUT', result)

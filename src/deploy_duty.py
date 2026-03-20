@@ -92,14 +92,30 @@ class MCPClient:
     def _read_sse(resp) -> dict:
         """Parse SSE stream, return last JSON-RPC result/error."""
         result = None
+        buf = ""
         for raw in resp.iter_lines(decode_unicode=True):
             if raw and raw.startswith("data: "):
+                buf = raw[6:]
+            elif raw and buf:
+                # Continuation of a multi-line data field
+                buf += raw
+            elif not raw and buf:
+                # Blank line = end of SSE event, try to parse buffered data
                 try:
-                    parsed = json.loads(raw[6:])
+                    parsed = json.loads(buf)
                     if "result" in parsed or "error" in parsed:
                         result = parsed
                 except json.JSONDecodeError:
                     pass
+                buf = ""
+        # Handle final buffered data if stream ends without trailing blank line
+        if buf:
+            try:
+                parsed = json.loads(buf)
+                if "result" in parsed or "error" in parsed:
+                    result = parsed
+            except json.JSONDecodeError:
+                pass
         if result is None:
             return {"error": {"code": -1, "message": "No result in SSE stream"}}
         return result

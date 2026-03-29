@@ -192,7 +192,7 @@ def _build_new_error_batch_blocks(errors: list[dict], start_idx: int, day_label:
     blocks: list[dict] = []
     for i, err in enumerate(errors, start=start_idx):
         app = err.get("app_tag", "unknown")
-        msg = _trunc(err.get("message", ""), 200)
+        msg = _trunc(err.get("message", ""), 300)
         detail = err.get("detail") or ""
         count = err.get("today", 0)
 
@@ -201,7 +201,7 @@ def _build_new_error_batch_blocks(errors: list[dict], start_idx: int, day_label:
             f"```{msg}```",
         ]
         if detail:
-            parts.append(f"_{_trunc(detail, 200)}_")
+            parts.append(f"_{_trunc(detail, 400)}_")
 
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(parts)}})
         blocks.append({"type": "divider"})
@@ -246,17 +246,25 @@ def _post_spikes_thread(
 
     for spike in spikes[:10]:
         app = spike.get("app_tag", "unknown")
-        msg = _trunc(spike.get("message", ""), 150)
+        msg = _trunc(spike.get("message", ""), 200)
+        detail = spike.get("detail") or ""
         today = spike.get("today", 0)
         lastweek = spike.get("lastweek", 0)
         avg = lastweek / 7 if lastweek else 0
         multiplier = f"{today / avg:.1f}x" if avg > 0 else "N/A"
 
+        parts = [
+            f"`{app}` *{_fmt(today)} {day_label}* (avg {_fmt(int(avg))}/day, {multiplier})",
+            f"```{msg}```",
+        ]
+        if detail:
+            parts.append(f"_{_trunc(detail, 300)}_")
+
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"`{app}` *{_fmt(today)} {day_label}* (avg {_fmt(int(avg))}/day, {multiplier})\n```{msg}```",
+                "text": "\n".join(parts),
             },
         })
 

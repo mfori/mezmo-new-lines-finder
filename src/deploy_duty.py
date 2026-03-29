@@ -284,9 +284,28 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
         app = (entry.get("_app") or entry.get("app")
                or ld.get("app") or "unknown")
 
-        # Extract detail info
+        # Extract exception info for grouping and display
+        exc_raw = ld.get("exception", "")
+        if isinstance(exc_raw, dict):
+            exc_name = exc_raw.get("name") or exc_raw.get("type") or ""
+            exc_message = exc_raw.get("message") or ""
+        else:
+            exc_name = str(exc_raw) if exc_raw else ""
+            exc_message = ""
+
+        # Extract detail info — include exception message, not just name
         details = []
-        for f in ("exception", "errorMessage", "error_message", "collection",
+        if exc_name:
+            details.append(f"exception: {exc_name}")
+        if exc_message:
+            details.append(f"message: {exc_message[:300]}")
+
+        # Additional useful fields
+        action_key = ld.get("body", {}).get("actionKey") if isinstance(ld.get("body"), dict) else None
+        if action_key:
+            details.append(f"actionKey: {action_key}")
+
+        for f in ("errorMessage", "error_message", "collection",
                    "statusCode", "status_code", "errorCode", "error_code"):
             v = ld.get(f)
             if v and str(v) != str(msg):
@@ -294,14 +313,13 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
                     v = v.get("name") or v.get("message") or json.dumps(v)
                 details.append(f"{f}: {v}")
 
-        # Exception name for grouping "Failed to handle request" variants
-        exc = ld.get("exception", "")
-        if isinstance(exc, dict):
-            exc = exc.get("name") or exc.get("type") or ""
-
+        # Build grouping key — always include exception message when present
+        # so that same top-level msg with different underlying errors stay separate
         norm = normalize(str(msg))
-        if "failed to handle request" in norm.lower() and exc:
-            key = f"{app}::{norm}::{normalize(str(exc))}"
+        if exc_message:
+            key = f"{app}::{norm}::{normalize(exc_message)}"
+        elif exc_name:
+            key = f"{app}::{norm}::{normalize(exc_name)}"
         else:
             key = f"{app}::{norm}"
 
@@ -316,8 +334,8 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
             groups[key] = {
                 "count": 0,
                 "app": app,
-                "message": str(msg)[:200],
-                "detail": "; ".join(details)[:300] if details else None,
+                "message": str(msg)[:300],
+                "detail": "; ".join(details)[:500] if details else None,
                 "sample": sample,
             }
         groups[key]["count"] += count

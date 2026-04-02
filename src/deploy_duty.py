@@ -955,42 +955,92 @@ def run_deploy_duty(
             f"{baseline_start.strftime('%b %d')}\u2013{(day_start - timedelta(days=1)).strftime('%b %d')}"
         )
 
-    # ── Query errors (2 parallel: today + last week) ────────────────────
-    queries = {
-        "today":    {"fromTime": day_start_iso, "toTime": day_end_iso,   "query": query},
-        "lastweek": {"fromTime": baseline_iso,  "toTime": day_start_iso, "query": query},
-    }
+    # ── Helper: query a single time range ─────────────────────────────────
+    def _query_range(label, from_iso, to_iso):
+        """Query Mezmo for a time range, return the MCP response."""
+        args = {"fromTime": from_iso, "toTime": to_iso, "query": query}
+        resp = mcp.call_tool("deduplicate_logs_time_range", args)
+        text = extract_text(resp)
+        # Detect "Query Too Large" error from MCP server
+        if "query too large" in text.lower() or (
+            resp.get("result", {}).get("isError") and "query too large" in text.lower()
+        ):
+            return label, resp, True
+        entries = parse_entries(text)
+        print(f"  {label}: {len(entries)} deduplicated entries")
+        if debug:
+            debug_path = SCRIPT_DIR / f"debug_{label}.json"
+            debug_path.write_text(json.dumps(resp, indent=2, default=str))
+            print(f"    debug saved to {debug_path}")
+        return label, resp, False
 
-    results = {}
+    # ── Split a time range into daily chunks ───────────────────────────────
+    def _daily_chunks(start: datetime, end: datetime):
+        """Yield (chunk_start, chunk_end) for each day in the range."""
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + timedelta(days=1), end)
+            yield cursor, chunk_end
+            cursor = chunk_end
+
+    # ── Query with automatic chunking on "too large" errors ────────────
+    def _query_chunked(label, start: datetime, end: datetime):
+        """Query a time range; if it's too large, split into daily chunks and retry."""
+        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        _, resp, too_large = _query_range(label, start_iso, end_iso)
+        if not too_large:
+            return [resp]
+
+        # Split into daily chunks and retry
+        chunks = list(_daily_chunks(start, end))
+        print(f"  {label}: query too large, splitting into {len(chunks)} daily chunks...")
+        chunk_responses = []
+        with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as chunk_pool:
+            chunk_futures = {
+                chunk_pool.submit(
+                    _query_range,
+                    f"{label}_d{i}",
+                    cs.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    ce.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                ): i
+                for i, (cs, ce) in enumerate(chunks)
+            }
+            for future in as_completed(chunk_futures):
+                i = chunk_futures[future]
+                try:
+                    _, chunk_resp, chunk_too_large = future.result()
+                    if chunk_too_large:
+                        print(f"  {label}_d{i}: still too large, skipping", file=sys.stderr)
+                    else:
+                        chunk_responses.append(chunk_resp)
+                except Exception as exc:
+                    print(f"  {label}_d{i}: FAILED - {exc}", file=sys.stderr)
+        return chunk_responses
+
+    # ── Query errors (today + last week with chunking) ─────────────────
     print(f"Querying Mezmo ({day_start_iso[:10]} + last {days_back} days)...")
+    raw_responses = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {
-            pool.submit(mcp.call_tool, "deduplicate_logs_time_range", args): name
-            for name, args in queries.items()
-        }
-        for future in as_completed(futures):
-            name = futures[future]
+        future_today = pool.submit(_query_chunked, "today", day_start, day_end)
+        future_week = pool.submit(_query_chunked, "lastweek", baseline_start, day_start)
+        for future, name in [(future_today, "today"), (future_week, "lastweek")]:
             try:
-                resp = future.result()
-                results[name] = resp
-                text = extract_text(resp)
-                entries = parse_entries(text)
-                print(f"  {name}: {len(entries)} deduplicated entries")
-                if debug:
-                    debug_path = SCRIPT_DIR / f"debug_{name}.json"
-                    debug_path.write_text(json.dumps(resp, indent=2, default=str))
-                    print(f"    debug saved to {debug_path}")
+                raw_responses[name] = future.result()
             except Exception as exc:
                 print(f"  {name}: FAILED - {exc}", file=sys.stderr)
-                results[name] = {"result": {"content": []}}
+                raw_responses[name] = []
 
-    # ── Process ─────────────────────────────────────────────────────────
+    # ── Process (merge entries from all chunk responses) ────────────────
     print("Processing results...")
 
     def _process(key):
-        text = extract_text(results[key])
-        entries = parse_entries(text)
-        return process_entries(entries)
+        all_entries = []
+        for resp in raw_responses.get(key, []):
+            text = extract_text(resp)
+            all_entries.extend(parse_entries(text))
+        return process_entries(all_entries)
 
     today_g, today_total = _process("today")
     week_g, week_total = _process("lastweek")
@@ -1069,44 +1119,91 @@ def main():
         f"{week_ago.strftime('%b %d')}\u2013{(today_start - timedelta(days=1)).strftime('%d')}"
     )
 
-    # ── Query errors (4 parallel) ───────────────────────────────────────
-    queries = {
-        "staging_today":    {"fromTime": today_iso, "toTime": now_iso,   "query": STAGING_Q},
-        "staging_lastweek": {"fromTime": week_iso,  "toTime": today_iso, "query": STAGING_Q},
-        "prod_today":       {"fromTime": today_iso, "toTime": now_iso,   "query": PROD_Q},
-        "prod_lastweek":    {"fromTime": week_iso,  "toTime": today_iso, "query": PROD_Q},
-    }
+    # ── Helper: query a single time range ─────────────────────────────────
+    def _query_range(label, from_iso, to_iso, q):
+        args = {"fromTime": from_iso, "toTime": to_iso, "query": q}
+        resp = mcp.call_tool("deduplicate_logs_time_range", args)
+        text = extract_text(resp)
+        if "query too large" in text.lower() or (
+            resp.get("result", {}).get("isError") and "query too large" in text.lower()
+        ):
+            return label, resp, True
+        entries = parse_entries(text)
+        print(f"  {label}: {len(entries)} deduplicated entries")
+        if DEBUG:
+            debug_path = SCRIPT_DIR / f"debug_{label}.json"
+            debug_path.write_text(json.dumps(resp, indent=2, default=str))
+            print(f"    debug saved to {debug_path}")
+        return label, resp, False
 
-    results = {}
+    def _daily_chunks(start: datetime, end: datetime):
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + timedelta(days=1), end)
+            yield cursor, chunk_end
+            cursor = chunk_end
+
+    def _query_chunked(label, start: datetime, end: datetime, q):
+        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        _, resp, too_large = _query_range(label, start_iso, end_iso, q)
+        if not too_large:
+            return [resp]
+        chunks = list(_daily_chunks(start, end))
+        print(f"  {label}: query too large, splitting into {len(chunks)} daily chunks...")
+        chunk_responses = []
+        with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as chunk_pool:
+            chunk_futures = {
+                chunk_pool.submit(
+                    _query_range, f"{label}_d{i}",
+                    cs.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    ce.strftime("%Y-%m-%dT%H:%M:%SZ"), q,
+                ): i
+                for i, (cs, ce) in enumerate(chunks)
+            }
+            for future in as_completed(chunk_futures):
+                i = chunk_futures[future]
+                try:
+                    _, chunk_resp, chunk_too_large = future.result()
+                    if chunk_too_large:
+                        print(f"  {label}_d{i}: still too large, skipping", file=sys.stderr)
+                    else:
+                        chunk_responses.append(chunk_resp)
+                except Exception as exc:
+                    print(f"  {label}_d{i}: FAILED - {exc}", file=sys.stderr)
+        return chunk_responses
+
+    # ── Query errors (4 parallel with auto-chunking) ───────────────────
     print(f"Querying Mezmo ({today_iso[:10]} + last 7 days, staging + prod)...")
+    raw_responses = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
+        task_map = {
+            "staging_today":    (today_start, now, STAGING_Q),
+            "staging_lastweek": (week_ago, today_start, STAGING_Q),
+            "prod_today":       (today_start, now, PROD_Q),
+            "prod_lastweek":    (week_ago, today_start, PROD_Q),
+        }
         futures = {
-            pool.submit(mcp.call_tool, "deduplicate_logs_time_range", args): name
-            for name, args in queries.items()
+            pool.submit(_query_chunked, name, s, e, q): name
+            for name, (s, e, q) in task_map.items()
         }
         for future in as_completed(futures):
             name = futures[future]
             try:
-                resp = future.result()
-                results[name] = resp
-                text = extract_text(resp)
-                entries = parse_entries(text)
-                print(f"  {name}: {len(entries)} deduplicated entries")
-                if DEBUG:
-                    debug_path = SCRIPT_DIR / f"debug_{name}.json"
-                    debug_path.write_text(json.dumps(resp, indent=2, default=str))
-                    print(f"    debug saved to {debug_path}")
+                raw_responses[name] = future.result()
             except Exception as exc:
                 print(f"  {name}: FAILED - {exc}", file=sys.stderr)
-                results[name] = {"result": {"content": []}}
+                raw_responses[name] = []
 
-    # ── Process ─────────────────────────────────────────────────────────
+    # ── Process (merge entries from all chunk responses) ────────────────
     print("Processing results...")
 
     def _process(key):
-        text = extract_text(results[key])
-        entries = parse_entries(text)
-        return process_entries(entries)
+        all_entries = []
+        for resp in raw_responses.get(key, []):
+            text = extract_text(resp)
+            all_entries.extend(parse_entries(text))
+        return process_entries(all_entries)
 
     stg_today_g, stg_today_total = _process("staging_today")
     stg_week_g, stg_week_total = _process("staging_lastweek")

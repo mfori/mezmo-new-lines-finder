@@ -191,13 +191,13 @@ def _build_summary_blocks(result: dict, dashboard_url: str | None = None) -> lis
 def _build_new_error_batch_blocks(errors: list[dict], start_idx: int, day_label: str = "today") -> list[dict]:
     blocks: list[dict] = []
     for i, err in enumerate(errors, start=start_idx):
-        app = err.get("app_tag", "unknown")
+        app_label = _format_apps_slack(err)
         msg = _trunc(err.get("message", ""), 300)
         detail = err.get("detail") or ""
         count = err.get("today", 0)
 
         parts = [
-            f"*#{i}* `{app}` \u2014 *{_fmt(count)}x {day_label}*",
+            f"*#{i}* {app_label} \u2014 *{_fmt(count)}x {day_label}*",
             f"```{msg}```",
         ]
         if detail:
@@ -245,7 +245,7 @@ def _post_spikes_thread(
     }]
 
     for spike in spikes[:10]:
-        app = spike.get("app_tag", "unknown")
+        app_label = _format_apps_slack(spike)
         msg = _trunc(spike.get("message", ""), 200)
         detail = spike.get("detail") or ""
         today = spike.get("today", 0)
@@ -254,7 +254,7 @@ def _post_spikes_thread(
         multiplier = f"{today / avg:.1f}x" if avg > 0 else "N/A"
 
         parts = [
-            f"`{app}` *{_fmt(today)} {day_label}* (avg {_fmt(int(avg))}/day, {multiplier})",
+            f"{app_label} *{_fmt(today)} {day_label}* (avg {_fmt(int(avg))}/day, {multiplier})",
             f"```{msg}```",
         ]
         if detail:
@@ -327,6 +327,18 @@ def _slack_get(token: str, method: str, params: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
+
+def _format_apps_slack(entry: dict) -> str:
+    apps = entry.get("apps", [])
+    if not apps:
+        return f"`{entry.get('app_tag', 'unknown')}`"
+    if len(apps) == 1:
+        return f"`{apps[0]}`"
+    if len(apps) <= 3:
+        return " ".join(f"`{a}`" for a in apps)
+    shown = " ".join(f"`{a}`" for a in apps[:3])
+    return f"{shown} +{len(apps) - 3} more"
+
 
 def _fmt(n: int) -> str:
     return f"{n:,}"

@@ -645,7 +645,8 @@ CSS = """\
   tbody tr:last-child td { border-bottom:none; }
   .table-wrap { background:var(--surface); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
   .table-wrap table thead th { background:var(--surface2); }
-  .app-tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; font-family:'SF Mono','Fira Code',monospace; background:var(--accent-dim); color:var(--accent); white-space:nowrap; }
+  .app-tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; font-family:'SF Mono','Fira Code',monospace; background:var(--accent-dim); color:var(--accent); margin:1px 0; }
+  .app-tags { display:flex; flex-wrap:wrap; gap:4px; }
   .msg-cell { font-family:'SF Mono','Fira Code',monospace; font-size:12px; line-height:1.5; word-break:break-word; max-width:600px; }
   .msg-cell .detail { color:var(--text-dim); font-size:11px; margin-top:4px; }
   .count-cell { font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -695,6 +696,15 @@ function filterTable(tableId, query) {
 """
 
 
+def _apps_html(entry: dict) -> str:
+    """Render app list as individual badges."""
+    apps = entry.get("apps", [])
+    if not apps:
+        return f'<span class="app-tag">{_e(entry.get("app_tag", "unknown"))}</span>'
+    badges = "".join(f'<span class="app-tag">{_e(a)}</span>' for a in apps)
+    return f'<div class="app-tags">{badges}</div>'
+
+
 def _detail_html(detail: str | None, style: str = "") -> str:
     if not detail:
         return ""
@@ -727,7 +737,7 @@ def _new_section(env: str, items: list[dict], day_label: str = "Today", env_labe
         rows += f"""
           <tr style="background:var(--red-dim);">
             <td class="count-cell trend-new">{_f(e["today"])}</td>
-            <td><span class="app-tag">{_e(e["app_tag"])}</span></td>
+            <td>{_apps_html(e)}</td>
             <td class="msg-cell">{_e(e["message"])}{_detail_html(e["detail"])}</td>
             <td><span class="badge" style="background:var(--red-dim);color:var(--red);border:1px solid var(--red);font-size:11px;">ERROR</span></td>
           </tr>"""
@@ -787,7 +797,7 @@ def _recurring_section(env: str, items: list[dict], day_label: str = "Today") ->
             <td class="count-cell trend-up" style="font-weight:900">{_f(e["today"])}</td>
             <td class="count-cell count-week">{_f(e["lastweek"])}</td>
             <td class="trend-up">&#9650; spike</td>
-            <td><span class="app-tag">{_e(e["app_tag"])}</span></td>
+            <td>{_apps_html(e)}</td>
             <td class="msg-cell">{_e(e["message"])}{_detail_html(e["detail"], "color:var(--orange);")}</td>
           </tr>"""
         elif e["trend"] == "lower":
@@ -796,7 +806,7 @@ def _recurring_section(env: str, items: list[dict], day_label: str = "Today") ->
             <td class="count-cell count-today">{_f(e["today"])}</td>
             <td class="count-cell count-week">{_f(e["lastweek"])}</td>
             <td class="trend-down">&#9660; lower</td>
-            <td><span class="app-tag">{_e(e["app_tag"])}</span></td>
+            <td>{_apps_html(e)}</td>
             <td class="msg-cell">{_e(e["message"])}{_detail_html(e["detail"])}</td>
           </tr>"""
         else:
@@ -805,7 +815,7 @@ def _recurring_section(env: str, items: list[dict], day_label: str = "Today") ->
             <td class="count-cell count-today">{_f(e["today"])}</td>
             <td class="count-cell count-week">{_f(e["lastweek"])}</td>
             <td class="trend-same">&#9679; normal</td>
-            <td><span class="app-tag">{_e(e["app_tag"])}</span></td>
+            <td>{_apps_html(e)}</td>
             <td class="msg-cell">{_e(e["message"])}{_detail_html(e["detail"])}</td>
           </tr>"""
 
@@ -863,7 +873,7 @@ def _resolved_section(env: str, items: list[dict], day_label: str = "Today", env
         rows += f"""
           <tr>
             <td class="count-cell" style="color:var(--green)">{_f(e["lastweek"])}</td>
-            <td><span class="app-tag">{_e(e["app_tag"])}</span></td>
+            <td>{_apps_html(e)}</td>
             <td class="msg-cell">{_e(e["message"])}{_detail_html(e["detail"])}</td>
           </tr>"""
 

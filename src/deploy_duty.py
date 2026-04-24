@@ -16,7 +16,7 @@ import subprocess
 import sys
 import platform
 import threading
-from collections import defaultdict
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from html import escape
@@ -35,6 +35,13 @@ DEBUG = "--debug" in sys.argv
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_FILE = SCRIPT_DIR / "mezmo-dashboard.html"
 MAX_RESOLVED_SHOWN = 30
+
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2.0
+RATE_LIMIT_DELAY = 10.0
+MIN_CHUNK = timedelta(minutes=5)
+MAX_WORKERS = 2
+ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 APPS = [
     "apify-app-daemons", "apify-api", "apify-app-daemons-new",
@@ -80,7 +87,6 @@ class MCPClient:
         )
         resp.raise_for_status()
         ct = resp.headers.get("Content-Type", "")
-        # Capture session id from any response
         sid = resp.headers.get("Mcp-Session")
         if sid:
             self.session_id = sid
@@ -97,10 +103,8 @@ class MCPClient:
             if raw and raw.startswith("data: "):
                 buf = raw[6:]
             elif raw and buf:
-                # Continuation of a multi-line data field
                 buf += raw
             elif not raw and buf:
-                # Blank line = end of SSE event, try to parse buffered data
                 try:
                     parsed = json.loads(buf)
                     if "result" in parsed or "error" in parsed:
@@ -108,7 +112,6 @@ class MCPClient:
                 except json.JSONDecodeError:
                     pass
                 buf = ""
-        # Handle final buffered data if stream ends without trailing blank line
         if buf:
             try:
                 parsed = json.loads(buf)
@@ -131,7 +134,6 @@ class MCPClient:
             },
         }
         data = self._post(payload, timeout=30)
-        # Send initialized notification (fire-and-forget)
         try:
             requests.post(
                 self.url, headers=self._headers(),
@@ -169,7 +171,6 @@ def parse_entries(text: str) -> list[dict]:
     """Parse log entries from MCP dedup response text."""
     if not text.strip():
         return []
-    # Try as JSON array or object with a list field
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -181,7 +182,6 @@ def parse_entries(text: str) -> list[dict]:
             return [data]
     except json.JSONDecodeError:
         pass
-    # Try JSONL
     entries = []
     for line in text.split("\n"):
         line = line.strip()
@@ -198,31 +198,20 @@ def parse_entries(text: str) -> list[dict]:
 
 def normalize(msg: str) -> str:
     """Normalize a log message by stripping variable parts."""
-    # UUIDs (v1–v5)
     msg = re.sub(
         r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
         r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>', msg)
-    # Hex hashes: MongoDB ObjectIDs (24), short SHAs (7-12), long SHAs (40)
     msg = re.sub(r'\b[0-9a-fA-F]{24}\b', '<HEX>', msg)
     msg = re.sub(r'\b[0-9a-fA-F]{40}\b', '<HEX>', msg)
-    msg = re.sub(r'\b[0-9a-f]{7,12}\b', '<HEX>', msg)
-    # Memory addresses
+    msg = re.sub(r'\b[0-9a-fA-F]{7,12}\b', '<HEX>', msg)
     msg = re.sub(r'0x[0-9a-fA-F]+', '<ADDR>', msg)
-    # IP addresses with optional port
     msg = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?', '<IP>', msg)
-    # ISO timestamps
     msg = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[.\dZ+:\-]*', '<TS>', msg)
-    # Durations with units (e.g., 1523ms, 3.2s, 500µs)
     msg = re.sub(r'\b\d+(\.\d+)?\s*(ms|µs|us|ns|s|sec|seconds|minutes|min)\b', '<DUR>', msg)
-    # Large numeric IDs (6+ digits)
     msg = re.sub(r'\b\d{6,}\b', '<ID>', msg)
-    # Labeled IDs (e.g., "request ID: 3", "id: 42")
     msg = re.sub(r'(?i)\b(id|ID|Id)[:\s]+\d+\b', r'\1: <ID>', msg)
-    # URL paths with numeric segments (e.g., /users/42/orders)
     msg = re.sub(r'(/[a-zA-Z_-]+)/\d+', r'\1/<ID>', msg)
-    # Kubernetes pod suffixes
     msg = re.sub(r'-[a-z0-9]{5,10}-[a-z0-9]{5}\b', '-<POD>', msg)
-    # Collapse whitespace
     msg = re.sub(r'\s+', ' ', msg).strip()
     return msg
 
@@ -248,7 +237,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
     total = 0
 
     for entry in entries:
-        # Unwrap {"log": {...}, "count": N} structure from MCP
         if "log" in entry and isinstance(entry["log"], dict):
             log = entry["log"]
             if "count" not in log and "count" in entry:
@@ -263,7 +251,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
                 count = 1
         total += count
 
-        # Parse _line
         raw = entry.get("_line", entry.get("line", ""))
         if isinstance(raw, str) and raw.strip():
             try:
@@ -275,7 +262,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
         else:
             ld = {}
 
-        # Fall back to entry-level fields
         if not ld:
             ld = entry
 
@@ -284,7 +270,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
         app = (entry.get("_app") or entry.get("app")
                or ld.get("app") or "unknown")
 
-        # Extract exception info for grouping and display
         exc_raw = ld.get("exception", "")
         if isinstance(exc_raw, dict):
             exc_name = exc_raw.get("name") or exc_raw.get("type") or ""
@@ -293,14 +278,12 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
             exc_name = str(exc_raw) if exc_raw else ""
             exc_message = ""
 
-        # Extract detail info — include exception message, not just name
         details = []
         if exc_name:
             details.append(f"exception: {exc_name}")
         if exc_message:
             details.append(f"message: {exc_message[:300]}")
 
-        # Additional useful fields
         action_key = ld.get("body", {}).get("actionKey") if isinstance(ld.get("body"), dict) else None
         if action_key:
             details.append(f"actionKey: {action_key}")
@@ -313,8 +296,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
                     v = v.get("name") or v.get("message") or json.dumps(v)
                 details.append(f"{f}: {v}")
 
-        # Build grouping key — always include exception message when present
-        # so that same top-level msg with different underlying errors stay separate
         norm = normalize(str(msg))
         if exc_message:
             key = f"{app}::{norm}::{normalize(exc_message)}"
@@ -324,7 +305,6 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
             key = f"{app}::{norm}"
 
         if key not in groups:
-            # Store full raw _line as sample for context
             if isinstance(raw, str) and raw.strip():
                 sample = raw
             elif isinstance(raw, dict):
@@ -386,6 +366,163 @@ def classify(today_g: dict, week_g: dict, days_back: int = 7, min_count: int = 1
     )
 
     return new, recurring, resolved
+
+
+# ── Querying ────────────────────────────────────────────────────────────────
+
+def _query_one(mcp_url: str, mcp_token: str, query: str,
+               start: datetime, end: datetime, label: str):
+    """Execute a single Mezmo dedup query with retry on transient errors.
+
+    Creates a fresh MCP session per attempt (no shared state across threads).
+    Returns (mcp_response_dict, too_large_bool).
+    Raises RuntimeError on permanent failures.
+    """
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            client = MCPClient(mcp_url, mcp_token)
+            init = client.initialize()
+            if "error" in init:
+                raise RuntimeError(f"{label}: MCP init failed: {init['error']}")
+
+            args = {
+                "from_time": start.strftime(ISO_FMT),
+                "to_time": end.strftime(ISO_FMT),
+                "query": query,
+            }
+            resp = client.call_tool("deduplicate_logs_time_range", args)
+
+            if "error" in resp:
+                raise RuntimeError(f"{label}: MCP error: {resp['error']}")
+
+            text = extract_text(resp)
+            if resp.get("result", {}).get("isError"):
+                text_lower = text.lower()
+                if "query too large" in text_lower:
+                    return resp, True
+                if "outside of retention" in text_lower:
+                    print(f"  {label}: outside retention period, skipping")
+                    return resp, False
+                raise RuntimeError(f"{label}: MCP tool error: {text[:500]}")
+
+            entries = parse_entries(text)
+            print(f"  {label}: {len(entries)} deduplicated entries")
+            return resp, False
+
+        except RuntimeError:
+            raise
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                is_rate_limit = exc.response is not None and exc.response.status_code == 429
+                if is_rate_limit:
+                    retry_after = exc.response.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else RATE_LIMIT_DELAY
+                else:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"  {label}: attempt {attempt + 1} failed "
+                      f"({'rate limited' if is_rate_limit else exc}), "
+                      f"retrying in {delay:.0f}s...")
+                time.sleep(delay)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"  {label}: attempt {attempt + 1} failed ({exc}), "
+                      f"retrying in {delay:.1f}s...")
+                time.sleep(delay)
+
+    raise RuntimeError(
+        f"{label}: all {MAX_RETRIES} attempts failed: {last_exc}")
+
+
+def _query_with_split(mcp_url: str, mcp_token: str, query: str,
+                      start: datetime, end: datetime, label: str):
+    """Query a time range, binary-splitting on 'Query Too Large'.
+
+    Returns a list of MCP response dicts (one per successful sub-chunk).
+    """
+    resp, too_large = _query_one(mcp_url, mcp_token, query, start, end, label)
+    if not too_large:
+        return [resp]
+
+    duration = end - start
+    if duration <= MIN_CHUNK:
+        raise RuntimeError(
+            f"{label}: chunk {start.isoformat()}..{end.isoformat()} "
+            f"({duration}) still exceeds Mezmo limit after splitting — "
+            f"narrow your query with more filters")
+
+    mid = start + duration / 2
+    print(f"  {label}: too large ({duration}), splitting into halves")
+    return (
+        _query_with_split(mcp_url, mcp_token, query, start, mid,
+                          f"{label}.a")
+        + _query_with_split(mcp_url, mcp_token, query, mid, end,
+                            f"{label}.b")
+    )
+
+
+def _daily_chunks(start: datetime, end: datetime):
+    """Yield (start, end) for each day in [start, end)."""
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + timedelta(days=1), end)
+        yield cursor, chunk_end
+        cursor = chunk_end
+
+
+def query_time_range(mcp_url: str, mcp_token: str, query: str,
+                     start: datetime, end: datetime,
+                     label: str = "range",
+                     max_workers: int = MAX_WORKERS) -> list[dict]:
+    """Query a Mezmo time range with automatic daily chunking.
+
+    Ranges longer than 24 hours are always split into daily chunks
+    to avoid Mezmo's dedup silently dropping entries when the data
+    volume is large.  Each chunk is retried on transient errors and
+    binary-split further if Mezmo reports "Query Too Large".
+
+    Returns a flat list of MCP response dicts from all chunks.
+    """
+    duration = end - start
+
+    if duration <= timedelta(hours=24):
+        return _query_with_split(mcp_url, mcp_token, query, start, end, label)
+
+    chunks = list(_daily_chunks(start, end))
+    print(f"  {label}: {duration.days}+ days, splitting into "
+          f"{len(chunks)} daily chunks")
+
+    all_responses: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _query_with_split, mcp_url, mcp_token, query,
+                cs, ce, f"{label}_d{i}",
+            ): (i, cs, ce)
+            for i, (cs, ce) in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            i, cs, ce = futures[future]
+            try:
+                all_responses.extend(future.result())
+            except Exception as exc:
+                print(f"  {label}_d{i} ({cs.strftime('%b %d')}): "
+                      f"FAILED — {exc}", file=sys.stderr)
+                raise
+
+    return all_responses
+
+
+def _collect_entries(responses: list[dict]) -> list[dict]:
+    """Extract and merge parsed entries from a list of MCP responses."""
+    all_entries: list[dict] = []
+    for resp in responses:
+        text = extract_text(resp)
+        all_entries.extend(parse_entries(text))
+    return all_entries
 
 
 # ── HTML Generation ─────────────────────────────────────────────────────────
@@ -908,137 +1045,66 @@ def run_deploy_duty(
 
     Returns a JSON-serializable dict with today-vs-last-week error comparison.
     """
-    # ── Time ranges ─────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     if day == "yesterday":
-        day_end = today_start                          # end of yesterday = start of today
-        day_start = today_start - timedelta(days=1)    # start of yesterday
+        day_end = today_start
+        day_start = today_start - timedelta(days=1)
     elif day == "last24h":
-        day_end = now                                  # up to current time
-        day_start = now - timedelta(hours=24)          # 24 hours ago
-    else:  # "today" (default)
-        day_end = now                                  # up to current time
-        day_start = today_start                        # start of today
+        day_end = now
+        day_start = now - timedelta(hours=24)
+    else:
+        day_end = now
+        day_start = today_start
 
     baseline_start = day_start - timedelta(days=days_back)
-
-    day_end_iso = day_end.strftime("%Y-%m-%dT%H:%M:%SZ")
-    day_start_iso = day_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    baseline_iso = baseline_start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     date_display = day_start.strftime("%b %d, %Y")
     if day == "yesterday":
         time_display = (
             f"{day_start.strftime('%b %d')} (full day) vs. "
-            f"{baseline_start.strftime('%b %d')}\u2013{(day_start - timedelta(days=1)).strftime('%b %d')}"
+            f"{baseline_start.strftime('%b %d')}–{(day_start - timedelta(days=1)).strftime('%b %d')}"
         )
     elif day == "last24h":
         time_display = (
-            f"Last 24h ({day_start.strftime('%b %d %H:%M')}\u2013{day_end.strftime('%H:%M')} UTC) vs. "
-            f"{baseline_start.strftime('%b %d')}\u2013{(day_start - timedelta(days=1)).strftime('%b %d')}"
+            f"Last 24h ({day_start.strftime('%b %d %H:%M')}–{day_end.strftime('%H:%M')} UTC) vs. "
+            f"{baseline_start.strftime('%b %d')}–{(day_start - timedelta(days=1)).strftime('%b %d')}"
         )
     else:
         time_display = (
-            f"00:00 \u2013 {now.strftime('%H:%M')} UTC vs. "
-            f"{baseline_start.strftime('%b %d')}\u2013{(day_start - timedelta(days=1)).strftime('%b %d')}"
+            f"00:00 – {now.strftime('%H:%M')} UTC vs. "
+            f"{baseline_start.strftime('%b %d')}–{(day_start - timedelta(days=1)).strftime('%b %d')}"
         )
 
-    # ── Single MCP query with a fresh session ──────────────────────────
-    ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
-    MIN_CHUNK = timedelta(minutes=5)
+    print(f"Querying Mezmo ({day_start.strftime('%Y-%m-%d')} + "
+          f"last {days_back} days baseline)...")
 
-    def _query_one(label: str, start: datetime, end: datetime):
-        """Run one Mezmo dedup query with a fresh MCP client/session.
+    today_responses = query_time_range(
+        mcp_url, mcp_token, query, day_start, day_end, "today")
+    week_responses = query_time_range(
+        mcp_url, mcp_token, query, baseline_start, day_start, "lastweek")
 
-        Returns (resp, too_large). Raises RuntimeError on any error other
-        than the server's "Query Too Large" response, which is signalled
-        via too_large=True so the caller can split the range.
-        """
-        client = MCPClient(mcp_url, mcp_token)
-        init = client.initialize()
-        if "error" in init:
-            raise RuntimeError(f"{label}: MCP init failed: {init['error']}")
-
-        args = {
-            "fromTime": start.strftime(ISO_FMT),
-            "toTime": end.strftime(ISO_FMT),
-            "query": query,
-        }
-        resp = client.call_tool("deduplicate_logs_time_range", args)
-
-        if "error" in resp:
-            raise RuntimeError(f"{label}: MCP error: {resp['error']}")
-
-        text = extract_text(resp)
-        if resp.get("result", {}).get("isError"):
-            if "query too large" in text.lower():
-                return resp, True
-            raise RuntimeError(f"{label}: MCP tool error: {text[:500]}")
-
-        entries = parse_entries(text)
-        print(f"  {label}: {len(entries)} deduplicated entries")
-        if debug:
+    if debug:
+        for label, responses in [("today", today_responses),
+                                 ("lastweek", week_responses)]:
             debug_path = SCRIPT_DIR / f"debug_{label}.json"
-            debug_path.write_text(json.dumps(resp, indent=2, default=str))
-            print(f"    debug saved to {debug_path}")
-        return resp, False
+            debug_path.write_text(json.dumps(responses, indent=2, default=str))
+            print(f"  debug saved to {debug_path}")
 
-    def _query_chunked(label: str, start: datetime, end: datetime) -> list:
-        """Query a time range; recursively split in half on 'Query Too Large'.
-
-        Each MCP call uses its own client/session. Raises RuntimeError if a
-        chunk at or below MIN_CHUNK is still too large — rather than silently
-        returning zero results.
-        """
-        resp, too_large = _query_one(label, start, end)
-        if not too_large:
-            return [resp]
-        duration = end - start
-        if duration <= MIN_CHUNK:
-            raise RuntimeError(
-                f"{label}: chunk {start.isoformat()}..{end.isoformat()} "
-                f"({duration}) still exceeds Mezmo's 1M log-line limit after "
-                f"splitting — narrow your query with more filters"
-            )
-        mid = start + duration / 2
-        print(f"  {label}: too large, splitting {duration} into halves")
-        return (
-            _query_chunked(f"{label}.a", start, mid)
-            + _query_chunked(f"{label}.b", mid, end)
-        )
-
-    # ── Query errors (today + last week in parallel) ───────────────────
-    print(f"Querying Mezmo ({day_start_iso[:10]} + last {days_back} days)...")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_today = pool.submit(_query_chunked, "today", day_start, day_end)
-        future_week = pool.submit(_query_chunked, "lastweek", baseline_start, day_start)
-        # Failures propagate out — zero results is a real bug, not an OK outcome.
-        raw_responses = {
-            "today": future_today.result(),
-            "lastweek": future_week.result(),
-        }
-
-    # ── Process (merge entries from all chunk responses) ────────────────
     print("Processing results...")
+    today_entries = _collect_entries(today_responses)
+    week_entries = _collect_entries(week_responses)
 
-    def _process(key):
-        all_entries = []
-        for resp in raw_responses.get(key, []):
-            text = extract_text(resp)
-            all_entries.extend(parse_entries(text))
-        return process_entries(all_entries)
+    today_g, today_total = process_entries(today_entries)
+    week_g, week_total = process_entries(week_entries)
 
-    today_g, today_total = _process("today")
-    week_g, week_total = _process("lastweek")
+    new, recurring, resolved = classify(
+        today_g, week_g, days_back=days_back, min_count=min_count)
 
-    new, recurring, resolved = classify(today_g, week_g, days_back=days_back, min_count=min_count)
+    day_label = {"yesterday": "Yesterday", "last24h": "Last 24h"}.get(
+        day, "Today")
 
-    # ── Day label for display ────────────────────────────────────────────
-    day_label = {"yesterday": "Yesterday", "last24h": "Last 24h"}.get(day, "Today")
-
-    # ── Build JSON output ──────────────────────────────────────────────
     data = {
         "date_display": date_display,
         "time_range_display": time_display,
@@ -1058,7 +1124,8 @@ def run_deploy_duty(
         "resolved": resolved,
     }
 
-    print(f"  New: {len(new)}, Recurring: {len(recurring)}, Resolved: {len(resolved)}")
+    print(f"  New: {len(new)}, Recurring: {len(recurring)}, "
+          f"Resolved: {len(resolved)}")
     return data
 
 
@@ -1075,6 +1142,18 @@ def open_file(path: Path):
         subprocess.run(["start", str(path)], shell=True)
 
 
+def _run_env_query(mcp_url, mcp_token, query, today_start, now, week_ago):
+    """Run today + lastweek queries for one environment, return processed groups."""
+    today_responses = query_time_range(
+        mcp_url, mcp_token, query, today_start, now, "today")
+    week_responses = query_time_range(
+        mcp_url, mcp_token, query, week_ago, today_start, "lastweek")
+
+    today_g, today_total = process_entries(_collect_entries(today_responses))
+    week_g, week_total = process_entries(_collect_entries(week_responses))
+    return today_g, today_total, week_g, week_total
+
+
 def main():
     if not MCP_TOKEN:
         sys.exit(
@@ -1082,126 +1161,28 @@ def main():
             "Usage: MEZMO_MCP_TOKEN=sts_xxx python3 deploy_duty.py [--debug]"
         )
 
-    mcp = MCPClient(MCP_URL, MCP_TOKEN)
-
-    # ── Initialize ──────────────────────────────────────────────────────
-    print("Initializing MCP session...")
-    init = mcp.initialize()
-    if "error" in init:
-        sys.exit(f"MCP init failed: {init['error']}")
-    server = init.get("result", {}).get("serverInfo", {})
-    print(f"  Connected to {server.get('name', '?')} v{server.get('version', '?')}")
-
-    # ── Time ranges ─────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = today_start - timedelta(days=7)
 
-    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    today_iso = today_start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    week_iso = week_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     date_display = now.strftime("%b %d, %Y")
     time_display = (
-        f"00:00 \u2013 {now.strftime('%H:%M')} UTC vs. "
-        f"{week_ago.strftime('%b %d')}\u2013{(today_start - timedelta(days=1)).strftime('%d')}"
+        f"00:00 – {now.strftime('%H:%M')} UTC vs. "
+        f"{week_ago.strftime('%b %d')}–{(today_start - timedelta(days=1)).strftime('%d')}"
     )
 
-    # ── Helper: query a single time range ─────────────────────────────────
-    def _query_range(label, from_iso, to_iso, q):
-        args = {"fromTime": from_iso, "toTime": to_iso, "query": q}
-        resp = mcp.call_tool("deduplicate_logs_time_range", args)
-        text = extract_text(resp)
-        if "query too large" in text.lower() or (
-            resp.get("result", {}).get("isError") and "query too large" in text.lower()
-        ):
-            return label, resp, True
-        entries = parse_entries(text)
-        print(f"  {label}: {len(entries)} deduplicated entries")
-        if DEBUG:
-            debug_path = SCRIPT_DIR / f"debug_{label}.json"
-            debug_path.write_text(json.dumps(resp, indent=2, default=str))
-            print(f"    debug saved to {debug_path}")
-        return label, resp, False
+    print(f"Querying Mezmo ({today_start.strftime('%Y-%m-%d')} + last 7 days, staging + prod)...")
 
-    def _daily_chunks(start: datetime, end: datetime):
-        cursor = start
-        while cursor < end:
-            chunk_end = min(cursor + timedelta(days=1), end)
-            yield cursor, chunk_end
-            cursor = chunk_end
-
-    def _query_chunked(label, start: datetime, end: datetime, q):
-        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-        _, resp, too_large = _query_range(label, start_iso, end_iso, q)
-        if not too_large:
-            return [resp]
-        chunks = list(_daily_chunks(start, end))
-        print(f"  {label}: query too large, splitting into {len(chunks)} daily chunks...")
-        chunk_responses = []
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as chunk_pool:
-            chunk_futures = {
-                chunk_pool.submit(
-                    _query_range, f"{label}_d{i}",
-                    cs.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    ce.strftime("%Y-%m-%dT%H:%M:%SZ"), q,
-                ): i
-                for i, (cs, ce) in enumerate(chunks)
-            }
-            for future in as_completed(chunk_futures):
-                i = chunk_futures[future]
-                try:
-                    _, chunk_resp, chunk_too_large = future.result()
-                    if chunk_too_large:
-                        print(f"  {label}_d{i}: still too large, skipping", file=sys.stderr)
-                    else:
-                        chunk_responses.append(chunk_resp)
-                except Exception as exc:
-                    print(f"  {label}_d{i}: FAILED - {exc}", file=sys.stderr)
-        return chunk_responses
-
-    # ── Query errors (4 parallel with auto-chunking) ───────────────────
-    print(f"Querying Mezmo ({today_iso[:10]} + last 7 days, staging + prod)...")
-    raw_responses = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        task_map = {
-            "staging_today":    (today_start, now, STAGING_Q),
-            "staging_lastweek": (week_ago, today_start, STAGING_Q),
-            "prod_today":       (today_start, now, PROD_Q),
-            "prod_lastweek":    (week_ago, today_start, PROD_Q),
-        }
-        futures = {
-            pool.submit(_query_chunked, name, s, e, q): name
-            for name, (s, e, q) in task_map.items()
-        }
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                raw_responses[name] = future.result()
-            except Exception as exc:
-                print(f"  {name}: FAILED - {exc}", file=sys.stderr)
-                raw_responses[name] = []
-
-    # ── Process (merge entries from all chunk responses) ────────────────
-    print("Processing results...")
-
-    def _process(key):
-        all_entries = []
-        for resp in raw_responses.get(key, []):
-            text = extract_text(resp)
-            all_entries.extend(parse_entries(text))
-        return process_entries(all_entries)
-
-    stg_today_g, stg_today_total = _process("staging_today")
-    stg_week_g, stg_week_total = _process("staging_lastweek")
-    prod_today_g, prod_today_total = _process("prod_today")
-    prod_week_g, prod_week_total = _process("prod_lastweek")
+    print("  Querying staging...")
+    stg_today_g, stg_today_total, stg_week_g, stg_week_total = _run_env_query(
+        MCP_URL, MCP_TOKEN, STAGING_Q, today_start, now, week_ago)
+    print("  Querying production...")
+    prod_today_g, prod_today_total, prod_week_g, prod_week_total = _run_env_query(
+        MCP_URL, MCP_TOKEN, PROD_Q, today_start, now, week_ago)
 
     stg_new, stg_recurring, stg_resolved = classify(stg_today_g, stg_week_g)
     prod_new, prod_recurring, prod_resolved = classify(prod_today_g, prod_week_g)
 
-    # ── Build data structure ────────────────────────────────────────────
     data = {
         "date_display": date_display,
         "time_range_display": time_display,
@@ -1247,21 +1228,13 @@ def main():
         },
     }
 
-    if DEBUG:
-        data_path = SCRIPT_DIR / "debug_data.json"
-        data_path.write_text(json.dumps(data, indent=2, default=str))
-        print(f"  Data saved to {data_path}")
-
-    # ── Generate HTML ───────────────────────────────────────────────────
     print("Generating dashboard...")
     html = generate_html(data)
     OUTPUT_FILE.write_text(html)
     print(f"  Written to {OUTPUT_FILE}")
 
-    # ── Open ────────────────────────────────────────────────────────────
     open_file(OUTPUT_FILE)
 
-    # ── Summary ─────────────────────────────────────────────────────────
     sm = data["summary"]
     print("\n── Deploy Duty Summary ──────────────────────────")
     print(f"  Date:       {date_display} ({time_display})")

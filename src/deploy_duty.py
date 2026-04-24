@@ -198,6 +198,8 @@ def parse_entries(text: str) -> list[dict]:
 
 def normalize(msg: str) -> str:
     """Normalize a log message by stripping variable parts."""
+    # Strip leading daemon name prefix (e.g., "ACTOR_JOB_CONTROLLER_DAEMON: ")
+    msg = re.sub(r'^[A-Z][A-Z0-9_]+:\s*', '', msg)
     msg = re.sub(
         r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
         r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>', msg)
@@ -221,6 +223,20 @@ def short_app(app: str) -> str:
     for pfx in ("apify-infinite-daemons-", "apify-app-daemons-"):
         if app.startswith(pfx) and len(app) > len(pfx):
             return app[len(pfx):]
+    return app
+
+
+def _app_group(app: str) -> str:
+    """Map specific daemon/service names to their app category for grouping.
+
+    All infinite-daemons share an app group so the same underlying error
+    (e.g. MongoServerError: CursorNotFound) hitting multiple daemons is
+    counted as one pattern, not N separate ones.
+    """
+    for pfx in ("apify-infinite-daemons-", "apify-app-daemons-",
+                 "apify-daemons-new-"):
+        if app.startswith(pfx):
+            return pfx.rstrip("-")
     return app
 
 
@@ -314,11 +330,11 @@ def process_entries(entries: list[dict],
 
         norm = normalize(str(msg))
         if exc_message:
-            key = f"{app}::{norm}::{normalize(exc_message)}"
+            key = f"{norm}::{normalize(exc_message)}"
         elif exc_name:
-            key = f"{app}::{norm}::{normalize(exc_name)}"
+            key = f"{norm}::{normalize(exc_name)}"
         else:
-            key = f"{app}::{norm}"
+            key = norm
 
         if key not in groups:
             if isinstance(raw, str) and raw.strip():
@@ -329,12 +345,16 @@ def process_entries(entries: list[dict],
                 sample = json.dumps(ld) if ld else None
             groups[key] = {
                 "count": 0,
-                "app": app,
+                "apps": set(),
                 "message": str(msg)[:300],
                 "detail": "; ".join(details)[:500] if details else None,
                 "sample": sample,
             }
         groups[key]["count"] += count
+        groups[key]["apps"].add(short_app(app))
+
+    for g in groups.values():
+        g["apps"] = sorted(g["apps"])
 
     return groups, total
 
@@ -345,8 +365,15 @@ def classify(today_g: dict, week_g: dict, days_back: int = 7, min_count: int = 1
     """Classify error patterns into new, recurring, resolved."""
     tk, wk = set(today_g), set(week_g)
 
+    def _apps_tag(g):
+        apps = g["apps"]
+        if len(apps) <= 3:
+            return ", ".join(apps)
+        return f"{', '.join(apps[:3])} +{len(apps) - 3} more"
+
     new = sorted(
-        [{"today": today_g[k]["count"], "app_tag": short_app(today_g[k]["app"]),
+        [{"today": today_g[k]["count"], "app_tag": _apps_tag(today_g[k]),
+          "apps": today_g[k]["apps"],
           "message": today_g[k]["message"], "detail": today_g[k]["detail"],
           "sample": today_g[k].get("sample")}
          for k in tk - wk if today_g[k]["count"] >= min_count],
@@ -367,14 +394,16 @@ def classify(today_g: dict, week_g: dict, days_back: int = 7, min_count: int = 1
             trend = "normal"
         recurring.append({
             "today": tc, "lastweek": wc, "trend": trend,
-            "app_tag": short_app(today_g[k]["app"]),
+            "app_tag": _apps_tag(today_g[k]),
+            "apps": today_g[k]["apps"],
             "message": today_g[k]["message"],
             "detail": today_g[k]["detail"],
             "sample": today_g[k].get("sample"),
         })
 
     resolved = sorted(
-        [{"lastweek": week_g[k]["count"], "app_tag": short_app(week_g[k]["app"]),
+        [{"lastweek": week_g[k]["count"], "app_tag": _apps_tag(week_g[k]),
+          "apps": week_g[k]["apps"],
           "message": week_g[k]["message"], "detail": week_g[k]["detail"],
           "sample": week_g[k].get("sample")}
          for k in wk - tk if week_g[k]["count"] >= min_count],

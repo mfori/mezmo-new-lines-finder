@@ -908,16 +908,6 @@ def run_deploy_duty(
 
     Returns a JSON-serializable dict with today-vs-last-week error comparison.
     """
-    mcp = MCPClient(mcp_url, mcp_token)
-
-    # ── Initialize ──────────────────────────────────────────────────────
-    print("Initializing MCP session...")
-    init = mcp.initialize()
-    if "error" in init:
-        raise RuntimeError(f"MCP init failed: {init['error']}")
-    server = init.get("result", {}).get("serverInfo", {})
-    print(f"  Connected to {server.get('name', '?')} v{server.get('version', '?')}")
-
     # ── Time ranges ─────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -955,82 +945,80 @@ def run_deploy_duty(
             f"{baseline_start.strftime('%b %d')}\u2013{(day_start - timedelta(days=1)).strftime('%b %d')}"
         )
 
-    # ── Helper: query a single time range ─────────────────────────────────
-    def _query_range(label, from_iso, to_iso):
-        """Query Mezmo for a time range, return the MCP response."""
-        args = {"fromTime": from_iso, "toTime": to_iso, "query": query}
-        resp = mcp.call_tool("deduplicate_logs_time_range", args)
+    # ── Single MCP query with a fresh session ──────────────────────────
+    ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
+    MIN_CHUNK = timedelta(minutes=5)
+
+    def _query_one(label: str, start: datetime, end: datetime):
+        """Run one Mezmo dedup query with a fresh MCP client/session.
+
+        Returns (resp, too_large). Raises RuntimeError on any error other
+        than the server's "Query Too Large" response, which is signalled
+        via too_large=True so the caller can split the range.
+        """
+        client = MCPClient(mcp_url, mcp_token)
+        init = client.initialize()
+        if "error" in init:
+            raise RuntimeError(f"{label}: MCP init failed: {init['error']}")
+
+        args = {
+            "fromTime": start.strftime(ISO_FMT),
+            "toTime": end.strftime(ISO_FMT),
+            "query": query,
+        }
+        resp = client.call_tool("deduplicate_logs_time_range", args)
+
+        if "error" in resp:
+            raise RuntimeError(f"{label}: MCP error: {resp['error']}")
+
         text = extract_text(resp)
-        # Detect "Query Too Large" error from MCP server
-        if "query too large" in text.lower() or (
-            resp.get("result", {}).get("isError") and "query too large" in text.lower()
-        ):
-            return label, resp, True
+        if resp.get("result", {}).get("isError"):
+            if "query too large" in text.lower():
+                return resp, True
+            raise RuntimeError(f"{label}: MCP tool error: {text[:500]}")
+
         entries = parse_entries(text)
         print(f"  {label}: {len(entries)} deduplicated entries")
         if debug:
             debug_path = SCRIPT_DIR / f"debug_{label}.json"
             debug_path.write_text(json.dumps(resp, indent=2, default=str))
             print(f"    debug saved to {debug_path}")
-        return label, resp, False
+        return resp, False
 
-    # ── Split a time range into daily chunks ───────────────────────────────
-    def _daily_chunks(start: datetime, end: datetime):
-        """Yield (chunk_start, chunk_end) for each day in the range."""
-        cursor = start
-        while cursor < end:
-            chunk_end = min(cursor + timedelta(days=1), end)
-            yield cursor, chunk_end
-            cursor = chunk_end
+    def _query_chunked(label: str, start: datetime, end: datetime) -> list:
+        """Query a time range; recursively split in half on 'Query Too Large'.
 
-    # ── Query with automatic chunking on "too large" errors ────────────
-    def _query_chunked(label, start: datetime, end: datetime):
-        """Query a time range; if it's too large, split into daily chunks and retry."""
-        start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        _, resp, too_large = _query_range(label, start_iso, end_iso)
+        Each MCP call uses its own client/session. Raises RuntimeError if a
+        chunk at or below MIN_CHUNK is still too large — rather than silently
+        returning zero results.
+        """
+        resp, too_large = _query_one(label, start, end)
         if not too_large:
             return [resp]
+        duration = end - start
+        if duration <= MIN_CHUNK:
+            raise RuntimeError(
+                f"{label}: chunk {start.isoformat()}..{end.isoformat()} "
+                f"({duration}) still exceeds Mezmo's 1M log-line limit after "
+                f"splitting — narrow your query with more filters"
+            )
+        mid = start + duration / 2
+        print(f"  {label}: too large, splitting {duration} into halves")
+        return (
+            _query_chunked(f"{label}.a", start, mid)
+            + _query_chunked(f"{label}.b", mid, end)
+        )
 
-        # Split into daily chunks and retry
-        chunks = list(_daily_chunks(start, end))
-        print(f"  {label}: query too large, splitting into {len(chunks)} daily chunks...")
-        chunk_responses = []
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as chunk_pool:
-            chunk_futures = {
-                chunk_pool.submit(
-                    _query_range,
-                    f"{label}_d{i}",
-                    cs.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    ce.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                ): i
-                for i, (cs, ce) in enumerate(chunks)
-            }
-            for future in as_completed(chunk_futures):
-                i = chunk_futures[future]
-                try:
-                    _, chunk_resp, chunk_too_large = future.result()
-                    if chunk_too_large:
-                        print(f"  {label}_d{i}: still too large, skipping", file=sys.stderr)
-                    else:
-                        chunk_responses.append(chunk_resp)
-                except Exception as exc:
-                    print(f"  {label}_d{i}: FAILED - {exc}", file=sys.stderr)
-        return chunk_responses
-
-    # ── Query errors (today + last week with chunking) ─────────────────
+    # ── Query errors (today + last week in parallel) ───────────────────
     print(f"Querying Mezmo ({day_start_iso[:10]} + last {days_back} days)...")
-    raw_responses = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_today = pool.submit(_query_chunked, "today", day_start, day_end)
         future_week = pool.submit(_query_chunked, "lastweek", baseline_start, day_start)
-        for future, name in [(future_today, "today"), (future_week, "lastweek")]:
-            try:
-                raw_responses[name] = future.result()
-            except Exception as exc:
-                print(f"  {name}: FAILED - {exc}", file=sys.stderr)
-                raw_responses[name] = []
+        # Failures propagate out — zero results is a real bug, not an OK outcome.
+        raw_responses = {
+            "today": future_today.result(),
+            "lastweek": future_week.result(),
+        }
 
     # ── Process (merge entries from all chunk responses) ────────────────
     print("Processing results...")

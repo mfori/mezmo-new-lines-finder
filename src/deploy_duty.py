@@ -226,12 +226,19 @@ def short_app(app: str) -> str:
 
 # ── Processing ──────────────────────────────────────────────────────────────
 
-def process_entries(entries: list[dict]) -> tuple[dict, int]:
+def parse_excluded_levels(query: str) -> set[str]:
+    """Extract -level:XXX exclusions from a Mezmo query string."""
+    return {m.upper() for m in re.findall(r'-level:(\S+)', query)}
+
+
+def process_entries(entries: list[dict],
+                    skip_levels: set[str] | None = None) -> tuple[dict, int]:
     """Normalize, group, and count log entries.
 
     Returns (groups_dict, total_error_count).
     groups_dict keys are "{app}::{normalized_msg}" and values are dicts with
     count, app, message, detail.
+    Entries whose level matches skip_levels are silently dropped.
     """
     groups: dict[str, dict] = {}
     total = 0
@@ -243,13 +250,16 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
                 log["count"] = entry["count"]
             entry = log
 
+        level = (entry.get("level") or entry.get("_level") or "").upper()
+        if skip_levels and level in skip_levels:
+            continue
+
         count = entry.get("count", entry.get("_count", 1))
         if isinstance(count, str):
             try:
                 count = int(count)
             except ValueError:
                 count = 1
-        total += count
 
         raw = entry.get("_line", entry.get("line", ""))
         if isinstance(raw, str) and raw.strip():
@@ -264,6 +274,12 @@ def process_entries(entries: list[dict]) -> tuple[dict, int]:
 
         if not ld:
             ld = entry
+
+        inner_level = (ld.get("level") or ld.get("_level") or "").upper()
+        if skip_levels and inner_level in skip_levels:
+            continue
+
+        total += count
 
         msg = (ld.get("msg") or ld.get("message") or ld.get("error")
                or str(ld)[:200])
@@ -1093,11 +1109,14 @@ def run_deploy_duty(
             print(f"  debug saved to {debug_path}")
 
     print("Processing results...")
+    skip_levels = parse_excluded_levels(query)
+    if skip_levels:
+        print(f"  Filtering out levels from query: {skip_levels}")
     today_entries = _collect_entries(today_responses)
     week_entries = _collect_entries(week_responses)
 
-    today_g, today_total = process_entries(today_entries)
-    week_g, week_total = process_entries(week_entries)
+    today_g, today_total = process_entries(today_entries, skip_levels)
+    week_g, week_total = process_entries(week_entries, skip_levels)
 
     new, recurring, resolved = classify(
         today_g, week_g, days_back=days_back, min_count=min_count)
@@ -1144,13 +1163,14 @@ def open_file(path: Path):
 
 def _run_env_query(mcp_url, mcp_token, query, today_start, now, week_ago):
     """Run today + lastweek queries for one environment, return processed groups."""
+    skip_levels = parse_excluded_levels(query)
     today_responses = query_time_range(
         mcp_url, mcp_token, query, today_start, now, "today")
     week_responses = query_time_range(
         mcp_url, mcp_token, query, week_ago, today_start, "lastweek")
 
-    today_g, today_total = process_entries(_collect_entries(today_responses))
-    week_g, week_total = process_entries(_collect_entries(week_responses))
+    today_g, today_total = process_entries(_collect_entries(today_responses), skip_levels)
+    week_g, week_total = process_entries(_collect_entries(week_responses), skip_levels)
     return today_g, today_total, week_g, week_total
 
 

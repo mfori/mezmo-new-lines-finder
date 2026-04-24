@@ -13,6 +13,7 @@ from functools import partial
 from apify import Actor
 
 from .deploy_duty import run_deploy_duty, generate_single_html
+from .routine_trigger import trigger_error_fixes
 from .slack_notifier import send_slack_notification
 
 
@@ -26,6 +27,7 @@ async def main() -> None:
         debug = actor_input.get('debug', False)
         slack_channel = actor_input.get('slackChannel')
         slack_token = actor_input.get('slackToken')
+        claude_token = actor_input.get('claudeToken')
         day = actor_input.get('day', 'today')
         days_back = actor_input.get('daysBack', 7)
         min_count = actor_input.get('minCount', 1)
@@ -59,6 +61,7 @@ async def main() -> None:
         Actor.log.info(f'Dashboard stored: {dashboard_url}')
 
         # Send Slack notification if configured
+        slack_thread_ts = None
         if slack_token and slack_channel:
             Actor.log.info(f'Sending Slack notification to channel {slack_channel}...')
             try:
@@ -72,6 +75,7 @@ async def main() -> None:
                 )
                 if slack_resp and slack_resp.get('ok'):
                     Actor.log.info('Slack notification sent successfully.')
+                    slack_thread_ts = slack_resp.get('ts')
                 else:
                     err = slack_resp.get('error', 'unknown') if slack_resp else 'no response'
                     Actor.log.warning(f'Slack notification failed: {err}')
@@ -79,6 +83,27 @@ async def main() -> None:
                 Actor.log.warning(f'Slack notification failed: {exc}')
         elif slack_channel and not slack_token:
             Actor.log.warning('slackChannel is set but slackToken input is missing — skipping Slack notification.')
+
+        # Trigger Claude Code routine for new errors
+        if claude_token and slack_thread_ts and slack_channel:
+            errors_to_fix = result.get('new', [])
+
+            if errors_to_fix:
+                Actor.log.info(f'Triggering Claude Code routine for {len(errors_to_fix)} new errors...')
+                try:
+                    triggered = await loop.run_in_executor(
+                        None,
+                        partial(
+                            trigger_error_fixes,
+                            errors=errors_to_fix, claude_token=claude_token,
+                            slack_channel=slack_channel, slack_thread_ts=slack_thread_ts,
+                        ),
+                    )
+                    Actor.log.info(f'Claude Code routine triggered for {triggered}/{len(errors_to_fix)} errors.')
+                except Exception as exc:
+                    Actor.log.warning(f'Claude Code routine trigger failed: {exc}')
+        elif claude_token and not slack_thread_ts:
+            Actor.log.warning('claudeToken is set but Slack notification failed — skipping routine triggers (no thread to reply to).')
 
         # Store in default dataset (accessible via API / UI)
         await Actor.push_data(result)

@@ -58,6 +58,13 @@
 			"description": "Minimum number of occurrences for an error to be included in the results.",
 			"default": 1,
 			"minimum": 1
+		},
+		"claudeToken": {
+			"title": "Claude API Token",
+			"type": "string",
+			"description": "Anthropic API token for triggering Claude Code routine to auto-fix errors. If set, new errors and spikes will be sent to the routine for investigation and PR creation.",
+			"editor": "textfield",
+			"isSecret": true
 		}
 	}
 }

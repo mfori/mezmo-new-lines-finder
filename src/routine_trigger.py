@@ -28,20 +28,8 @@ def trigger_error_fixes(
     triggered = 0
 
     for err in errors[:MAX_TRIGGERS]:
-        payload = {
-            "inputs": {
-                "message": err.get("message", ""),
-                "detail": err.get("detail") or "",
-                "sample": err.get("sample", ""),
-                "apps": err.get("apps", []),
-                "app_tag": err.get("app_tag", ""),
-                "today": err.get("today", 0),
-                "lastweek": err.get("lastweek", 0),
-                "trend": err.get("trend", ""),
-                "slack_channel": slack_channel,
-                "slack_thread_ts": slack_thread_ts,
-            },
-        }
+        prompt = _build_prompt(err, slack_channel, slack_thread_ts)
+        payload = {"text": prompt}
 
         try:
             resp = requests.post(
@@ -49,6 +37,8 @@ def trigger_error_fixes(
                 headers={
                     "Authorization": f"Bearer {claude_token}",
                     "Content-Type": "application/json",
+                    "anthropic-beta": "experimental-cc-routine-2026-04-01",
+                    "anthropic-version": "2023-06-01",
                 },
                 json=payload,
                 timeout=30,
@@ -72,6 +62,23 @@ def trigger_error_fixes(
         logger.info("Skipped %d errors (max %d triggers per run)", skipped, MAX_TRIGGERS)
 
     return triggered
+
+
+def _build_prompt(err: dict, slack_channel: str, slack_thread_ts: str) -> str:
+    parts = [
+        f"message: {err.get('message', '')}",
+        f"detail: {err.get('detail') or 'N/A'}",
+        f"apps: {', '.join(err.get('apps', []))}",
+        f"today_count: {err.get('today', 0)}",
+        f"lastweek_count: {err.get('lastweek', 0)}",
+        f"trend: {err.get('trend', 'new')}",
+        f"slack_channel: {slack_channel}",
+        f"slack_thread_ts: {slack_thread_ts}",
+    ]
+    sample = err.get("sample", "")
+    if sample:
+        parts.append(f"sample (raw JSON log entry):\n{sample}")
+    return "\n".join(parts)
 
 
 def _short(err: dict) -> str:

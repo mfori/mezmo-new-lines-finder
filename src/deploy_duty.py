@@ -200,6 +200,11 @@ def normalize(msg: str) -> str:
     """Normalize a log message by stripping variable parts."""
     # Strip leading daemon name prefix (e.g., "ACTOR_JOB_CONTROLLER_DAEMON: ")
     msg = re.sub(r'^[A-Z][A-Z0-9_]+:\s*', '', msg)
+    # Extract root cause from "caused by" chains
+    if ':: caused by ::' in msg:
+        msg = msg.rsplit(':: caused by ::', 1)[-1].strip()
+    # MongoDB hostnames (e.g., apify-staging-shard-00-02-shcdj.mongodb.net:27017)
+    msg = re.sub(r'[\w.-]+\.mongodb\.net(:\d+)?', '<MONGO_HOST>', msg)
     msg = re.sub(
         r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
         r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>', msg)
@@ -330,9 +335,9 @@ def process_entries(entries: list[dict],
 
         norm = normalize(str(msg))
         if exc_message:
-            key = f"{norm}::{normalize(exc_message)}"
+            key = f"{exc_name}::{normalize(exc_message)}"
         elif exc_name:
-            key = f"{norm}::{normalize(exc_name)}"
+            key = normalize(exc_name)
         else:
             key = norm
 
